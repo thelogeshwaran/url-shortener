@@ -9,4 +9,6 @@ class Url(SQLModel, table=True):
     original_url: str = Field(index=True)
     short_code: str = Field(unique=True, index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    click_count: int = Field(default=0)
+    last_accessed_at: datetime | None = None
     

@@ -2,6 +2,7 @@ from fastapi import HTTPException
 
 from app.utils import generate_code
 from app.repositories import UrlRepository
+from fastapi import responses
 
 
 class UrlService:
@@ -9,9 +10,6 @@ class UrlService:
         self.repository = repository
 
     def shorten(self, url: str) -> str:
-        existing = self.repository.get_code_by_url(url)
-        if existing:
-            return existing
         code = generate_code()
         while self.repository.code_exists(code):
             code = generate_code()
@@ -23,8 +21,8 @@ class UrlService:
         if not deleted:
             raise HTTPException(status_code=404, detail='Short code not found')
 
-    def get_original_url(self, code: str) -> str:
-        url = self.repository.get_url_by_code(code)
-        if url is None:
+    def redirect(self, code: str):
+        original_url = self.repository.update_click_stats(code)
+        if not original_url:
             raise HTTPException(status_code=404, detail='Short code not found')
-        return url
+        return responses.RedirectResponse(url=original_url)

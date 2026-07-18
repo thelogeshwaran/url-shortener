@@ -1,4 +1,5 @@
-from sqlmodel import select
+from datetime import datetime, timezone
+from sqlmodel import select, update
 
 from app.database import get_session
 from app.models import Url
@@ -15,12 +16,6 @@ class UrlRepository:
             stmt = select(Url).where(Url.short_code == code)
             url = session.exec(stmt).first()
             return url.original_url if url else None
-
-    def get_code_by_url(self, url: str) -> str | None:
-        with get_session() as session:
-            stmt = select(Url).where(Url.original_url == url)
-            url = session.exec(stmt).first()
-            return url.short_code if url else None
           
     def delete_url(self, code: str) -> bool:
         with get_session() as session:
@@ -37,3 +32,18 @@ class UrlRepository:
             stmt = select(Url).where(Url.short_code == code)
             url = session.exec(stmt).first()
             return url is not None
+
+    def update_click_stats(self, code: str) -> str | None:
+        with get_session() as session:
+            stmt = (
+                update(Url)
+                .where(Url.short_code == code)
+                .values(
+                    click_count=Url.click_count + 1,
+                    last_accessed_at=datetime.now(timezone.utc)
+                )
+                .returning(Url.original_url)
+            )
+            result = session.exec(stmt).first()
+            session.commit()
+            return result[0] if result else None

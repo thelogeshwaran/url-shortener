@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, responses
+from fastapi import APIRouter, Depends
 
 from app.repositories import UrlRepository
 from app.schemas import ShortenRequest, ShortenResponse
@@ -24,8 +24,7 @@ def shorten(
 
 @router.get('/redirect')
 def redirect(code: str, service: Annotated[UrlService, Depends(get_service)]):
-    original_url = service.get_original_url(code)
-    return responses.RedirectResponse(url=original_url)
+    return service.redirect(code)
 
 
 @router.delete('/urls/{code}', status_code=204)
