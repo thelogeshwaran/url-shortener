@@ -4,7 +4,7 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.main import app
-from app.models import Url
+from app.models import Url, User
 
 client = TestClient(app)
 
@@ -13,6 +13,23 @@ def _get_url_row(code: str) -> Url | None:
     """Read a row straight from the DB to verify side effects."""
     with get_session() as session:
         return session.exec(select(Url).where(Url.short_code == code)).first()
+
+
+def _get_test_user(email: str) -> User:
+    """Fetch-or-create a test user; the api_key is stable across runs."""
+    with get_session() as session:
+        user = session.exec(select(User).where(User.email == email)).first()
+        if user is None:
+            user = User(email=email, name="Test User", api_key=f"test-{uuid.uuid4().hex}")
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+        return user
+
+
+def _shorten(url: str, api_key: str | None = None) -> str:
+    headers = {"X-API-Key": api_key} if api_key else {}
+    return client.post("/shorten", json={"url": url}, headers=headers).json()["short_url"]
 
 
 def test_shorten_and_redirect():
@@ -44,10 +61,11 @@ def test_delete_short_code():
     Deleting a short code must return 204, and the code must
     stop redirecting afterwards (404).
     """
+    user = _get_test_user("owner@test.com")
     random_url = f"https://example.com/{uuid.uuid4()}"
-    short_code = client.post("/shorten", json={"url": random_url}).json()["short_url"]
+    short_code = _shorten(random_url, user.api_key)
 
-    response = client.delete(f"/urls/{short_code}")
+    response = client.delete(f"/urls/{short_code}", headers={"X-API-Key": user.api_key})
     assert response.status_code == 204
 
     # the mapping is gone: redirect must now 404
@@ -59,7 +77,8 @@ def test_delete_unknown_code_returns_404():
     """
     Deleting a short code that doesn't exist must return 404.
     """
-    response = client.delete("/urls/nonexistent123")
+    user = _get_test_user("owner@test.com")
+    response = client.delete("/urls/nonexistent123", headers={"X-API-Key": user.api_key})
     assert response.status_code == 404
     assert response.json()["detail"] == "Short code not found"
 
@@ -150,13 +169,77 @@ def test_failed_redirect_does_not_increment():
     """
     A 404 on a deleted code must not resurrect or count anything.
     """
+    user = _get_test_user("owner@test.com")
     random_url = f"https://example.com/{uuid.uuid4()}"
-    code = client.post("/shorten", json={"url": random_url}).json()["short_url"]
-    client.delete(f"/urls/{code}")
+    code = _shorten(random_url, user.api_key)
+    client.delete(f"/urls/{code}", headers={"X-API-Key": user.api_key})
 
     response = client.get(f"/redirect?code={code}", follow_redirects=False)
     assert response.status_code == 404
-    assert _get_url_row(code) is None
+    assert _get_url_row(code).deleted_at is not None
+
+
+def test_shorten_with_api_key_links_owner():
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    assert _get_url_row(code).user_id == user.id
+
+
+def test_shorten_without_api_key_is_anonymous():
+    code = _shorten(f"https://example.com/{uuid.uuid4()}")
+    assert _get_url_row(code).user_id is None
+
+
+def test_invalid_api_key_returns_401():
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com"},
+        headers={"X-API-Key": "definitely-not-a-real-key"},
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid API key"
+
+
+def test_owner_can_delete_own_link():
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+
+    response = client.delete(f"/urls/{code}", headers={"X-API-Key": user.api_key})
+    assert response.status_code == 204
+
+    assert _get_url_row(code).deleted_at is not None   # soft-deleted, row remains
+    assert client.get(f"/redirect?code={code}", follow_redirects=False).status_code == 404
+
+
+def test_non_owner_cannot_delete():
+    owner = _get_test_user("owner@test.com")
+    intruder = _get_test_user("intruder@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", owner.api_key)
+
+    response = client.delete(f"/urls/{code}", headers={"X-API-Key": intruder.api_key})
+    assert response.status_code == 403
+
+    # link untouched: not soft-deleted, still redirects
+    assert _get_url_row(code).deleted_at is None
+    assert client.get(f"/redirect?code={code}", follow_redirects=False).status_code == 307
+
+
+def test_delete_without_api_key_returns_401():
+    owner = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", owner.api_key)
+
+    response = client.delete(f"/urls/{code}")
+    assert response.status_code == 401
+    assert _get_url_row(code).deleted_at is None       # nothing was deleted
+
+
+def test_authenticated_user_can_delete_anonymous_link():
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}")   # created with no key
+
+    response = client.delete(f"/urls/{code}", headers={"X-API-Key": user.api_key})
+    assert response.status_code == 204
+    assert _get_url_row(code).deleted_at is not None
 
 
 def test_invalid_url_rejected():
