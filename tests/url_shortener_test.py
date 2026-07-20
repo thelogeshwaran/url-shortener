@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
@@ -240,6 +241,108 @@ def test_authenticated_user_can_delete_anonymous_link():
     response = client.delete(f"/urls/{code}", headers={"X-API-Key": user.api_key})
     assert response.status_code == 204
     assert _get_url_row(code).deleted_at is not None
+
+
+def _expire_link(code: str) -> None:
+    """Force a link into the past — no sleep() needed."""
+    with get_session() as session:
+        url = session.exec(select(Url).where(Url.short_code == code)).first()
+        url.expires_at = datetime.utcnow() - timedelta(hours=1)
+        session.add(url)
+        session.commit()
+
+
+def test_shorten_with_future_expiry_redirects():
+    random_url = f"https://example.com/{uuid.uuid4()}"
+    expiry = (datetime.utcnow() + timedelta(days=1)).isoformat()
+    response = client.post("/shorten", json={"url": random_url, "expires_at": expiry})
+    assert response.status_code == 200
+
+    code = response.json()["short_url"]
+    assert _get_url_row(code).expires_at is not None
+
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 307
+
+
+def test_expired_link_returns_410():
+    code = _shorten(f"https://example.com/{uuid.uuid4()}")
+    _expire_link(code)
+
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 410
+    assert response.json()["detail"] == "Short code expired"
+
+
+def test_expired_link_does_not_increment_clicks():
+    code = _shorten(f"https://example.com/{uuid.uuid4()}")
+    _expire_link(code)
+
+    client.get(f"/redirect?code={code}", follow_redirects=False)
+    row = _get_url_row(code)
+    assert row.click_count == 0
+    assert row.last_accessed_at is None
+
+
+def test_past_expiry_rejected_on_create():
+    expiry = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com", "expires_at": expiry},
+    )
+    assert response.status_code == 422
+
+
+def test_no_expiry_means_never_expires():
+    code = _shorten(f"https://example.com/{uuid.uuid4()}")
+    assert _get_url_row(code).expires_at is None
+
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 307
+
+
+def test_custom_code_is_used():
+    random_url = f"https://example.com/{uuid.uuid4()}"
+    custom = f"my-article-{uuid.uuid4().hex[:8]}"
+
+    response = client.post("/shorten", json={"url": random_url, "code": custom})
+    assert response.status_code == 200
+    assert response.json()["short_url"] == custom
+
+    response = client.get(f"/redirect?code={custom}", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"].rstrip("/") == random_url
+
+
+def test_duplicate_custom_code_returns_409():
+    custom = f"taken-{uuid.uuid4().hex[:8]}"
+    first = client.post("/shorten", json={"url": "https://example.com", "code": custom})
+    assert first.status_code == 200
+
+    second = client.post("/shorten", json={"url": "https://example.com/other", "code": custom})
+    assert second.status_code == 409
+    assert second.json()["detail"] == "Short code already exists"
+
+
+def test_custom_code_cannot_reuse_deleted_code():
+    """Soft-deleted codes still own their name — no hijacking dead links."""
+    user = _get_test_user("owner@test.com")
+    custom = f"dead-{uuid.uuid4().hex[:8]}"
+    client.post(
+        "/shorten",
+        json={"url": "https://example.com", "code": custom},
+        headers={"X-API-Key": user.api_key},
+    )
+    client.delete(f"/urls/{custom}", headers={"X-API-Key": user.api_key})
+
+    response = client.post("/shorten", json={"url": "https://example.com", "code": custom})
+    assert response.status_code == 409
+
+
+def test_omitted_code_still_autogenerates():
+    response = client.post("/shorten", json={"url": "https://example.com"})
+    assert response.status_code == 200
+    assert len(response.json()["short_url"]) == 6  # generated, not custom
 
 
 def test_invalid_url_rejected():

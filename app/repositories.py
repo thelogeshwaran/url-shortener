@@ -1,14 +1,14 @@
 from datetime import datetime, timezone
-from sqlmodel import select, update
+from sqlmodel import or_, select, update
 
 from app.database import get_session
 from app.models import Url, User
 
 
 class UrlRepository: 
-    def save_url(self, code: str, long_url: str, user_id: int | None = None) -> None:
+    def save_url(self, code: str, long_url: str, user_id: int | None = None, expires_at: datetime | None = None) -> None:
         with get_session() as session:
-            session.add(Url(short_code=code, original_url=long_url, user_id=user_id))
+            session.add(Url(short_code=code, original_url=long_url, user_id=user_id, expires_at=expires_at))
             session.commit()
 
     def get_url_by_code(self, code: str) -> Url | None:
@@ -37,7 +37,10 @@ class UrlRepository:
         with get_session() as session:
             stmt = (
                 update(Url)
-                .where(Url.short_code == code,  Url.deleted_at == None)
+                .where(Url.short_code == code,  Url.deleted_at == None, or_(
+                    Url.expires_at.is_(None),
+                    Url.expires_at > datetime.now(timezone.utc)
+                ))
                 .values(
                     click_count=Url.click_count + 1,
                     last_accessed_at=datetime.now(timezone.utc)

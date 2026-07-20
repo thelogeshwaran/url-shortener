@@ -34,7 +34,7 @@ def shorten(
     service: Annotated[UrlService, Depends(get_service)],
     user: Annotated[User | None, Depends(get_current_user)]
 ) -> ShortenResponse:
-    code = service.shorten(str(request.url), user)
+    code = service.shorten(request, user)
     return ShortenResponse(short_url=code)
 
 

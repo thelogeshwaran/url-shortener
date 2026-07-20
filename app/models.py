@@ -13,6 +13,7 @@ class Url(SQLModel, table=True):
     last_accessed_at: datetime | None = None
     deleted_at: datetime | None = None
     user_id: int | None = Field(default=None, foreign_key="users.id")
+    expires_at: datetime | None = None
 
 
 class User(SQLModel, table=True):
