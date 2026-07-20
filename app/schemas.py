@@ -78,3 +78,20 @@ class EditUrlRequest(BaseModel):
         if len(v) < 4:
             raise ValueError("Password must be at least 4 characters long.")
         return v
+
+
+class UrlResponse(BaseModel):
+    model_config = {"from_attributes": True}
+    original_url: str
+    short_code: str
+    created_at: datetime
+    expires_at: datetime | None = None
+    last_accessed_at: datetime | None = None
+    click_count: int = 0
+
+
+class PaginatedUrlsResponse(BaseModel):
+    urls: list[UrlResponse]
+    total: int
+    page: int
+    size: int

@@ -73,6 +73,18 @@ class UrlRepository:
             result = session.exec(stmt).first()
             session.commit()
             return result[0] if result else None
+    
+    def list_urls_by_user(self, user_id: int, page: int, size: int) -> list[Url]:
+        with get_session() as session:
+            stmt = select(Url).where(Url.user_id == user_id).offset((page - 1) * size).limit(size)
+            urls = session.exec(stmt).all()
+            return urls
+    
+    def count_urls_by_user(self, user_id: int) -> int:
+        with get_session() as session:
+            stmt = select(Url).where(Url.user_id == user_id)
+            urls = session.exec(stmt).all()
+            return len(urls)
 
 
 class UserRepository: 

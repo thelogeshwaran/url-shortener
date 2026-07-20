@@ -4,7 +4,7 @@ from app.utils import generate_code
 from app.repositories import UrlRepository, UserRepository
 from fastapi import responses
 from app.models import User
-from app.schemas import ShortenRequest, BatchShortenRequest, BatchShortenResponse, BatchItemResult, EditUrlRequest
+from app.schemas import ShortenRequest, BatchShortenRequest, BatchShortenResponse, BatchItemResult, EditUrlRequest, PaginatedUrlsResponse
 from datetime import datetime
 from bcrypt import hashpw, gensalt, checkpw
 
@@ -88,6 +88,11 @@ class UrlService:
         if not edited:
             raise HTTPException(status_code=404, detail='Short code not found')
         return edited
+    
+    def get_all_urls_by_user(self, user_id: int, page: int, size: int) -> PaginatedUrlsResponse:
+        urls = self.repository.list_urls_by_user(user_id, page, size)
+        total = self.repository.count_urls_by_user(user_id)
+        return PaginatedUrlsResponse(urls=urls, total=total, page=page, size=size)
 
 
 class UserService:

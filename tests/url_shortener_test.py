@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime, timedelta
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
@@ -751,3 +752,120 @@ def test_code_is_case_sensitive():
         response = client.get(f"/redirect?code={flipped}", follow_redirects=False)
         assert response.status_code in (404, 307)
 
+
+
+def test_list_urls_requires_api_key():
+    response = client.get("/urls")
+    assert response.status_code == 401
+
+
+def test_list_urls_returns_only_own_urls():
+    owner = _get_test_user("list-owner@test.com")
+    other = _get_test_user("list-other@test.com")
+
+    owner_url = f"https://example.com/{uuid.uuid4()}"
+    other_url = f"https://example.com/{uuid.uuid4()}"
+    _shorten(owner_url, owner.api_key)
+    _shorten(other_url, other.api_key)
+
+    response = client.get("/urls", headers={"X-API-Key": owner.api_key})
+    assert response.status_code == 200
+
+    body = response.json()
+    returned_urls = [item["original_url"] for item in body["urls"]]
+    assert owner_url in returned_urls
+    assert other_url not in returned_urls
+
+
+def test_list_urls_does_not_expose_password_hash():
+    user = _get_test_user("list-pw@test.com")
+    client.post(
+        "/shorten",
+        json={"url": f"https://example.com/{uuid.uuid4()}", "password": "secret1"},
+        headers={"X-API-Key": user.api_key},
+    )
+
+    response = client.get("/urls", headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+    for item in response.json()["urls"]:
+        assert "password_hash" not in item
+        assert "password" not in item
+
+
+def test_list_urls_pagination_respects_size():
+    user = _get_test_user("list-paginate@test.com")
+    for _ in range(5):
+        _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+
+    response = client.get("/urls?page=1&size=2", headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["urls"]) == 2
+    assert body["page"] == 1
+    assert body["size"] == 2
+    assert body["total"] >= 5
+
+
+def test_list_urls_second_page_returns_different_items():
+    user = _get_test_user("list-page2@test.com")
+    codes = [_shorten(f"https://example.com/{uuid.uuid4()}", user.api_key) for _ in range(5)]
+
+    page1 = client.get("/urls?page=1&size=2", headers={"X-API-Key": user.api_key}).json()
+    page2 = client.get("/urls?page=2&size=2", headers={"X-API-Key": user.api_key}).json()
+
+    page1_codes = {item["short_code"] for item in page1["urls"]}
+    page2_codes = {item["short_code"] for item in page2["urls"]}
+    assert page1_codes.isdisjoint(page2_codes)
+
+
+def test_list_urls_total_reflects_full_count_not_page_size():
+    user = _get_test_user("list-total@test.com")
+    for _ in range(3):
+        _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+
+    response = client.get("/urls?page=1&size=1", headers={"X-API-Key": user.api_key})
+    body = response.json()
+    assert len(body["urls"]) == 1
+    assert body["total"] >= 3
+
+
+def test_list_urls_empty_for_user_with_no_links():
+    user = _get_test_user("list-empty@test.com")
+    response = client.get("/urls", headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["urls"] == []
+    assert body["total"] == 0
+
+
+def test_health_check_reports_ok_when_db_reachable():
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["database"] == "ok"
+
+
+def test_health_check_requires_no_api_key():
+    response = client.get("/health")
+    assert response.status_code != 401
+
+
+def test_health_check_reports_503_when_db_unreachable():
+    with patch("app.routers.get_session", side_effect=Exception("connection refused")):
+        response = client.get("/health")
+    assert response.status_code == 503
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["database"] == "unreachable"
+
+
+def test_health_check_does_not_leak_internal_error_details():
+    with patch(
+        "app.routers.get_session",
+        side_effect=Exception("password authentication failed for user 'postgres' at 10.0.0.5"),
+    ):
+        response = client.get("/health")
+    assert "postgres" not in response.text
+    assert "10.0.0.5" not in response.text
+    assert "password" not in response.text
