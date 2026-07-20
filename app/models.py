@@ -14,6 +14,7 @@ class Url(SQLModel, table=True):
     deleted_at: datetime | None = None
     user_id: int | None = Field(default=None, foreign_key="users.id")
     expires_at: datetime | None = None
+    password_hash: str | None = Field(default=None)
 
 
 class User(SQLModel, table=True):
@@ -24,3 +25,4 @@ class User(SQLModel, table=True):
     email: str = Field(unique=True, index=True)
     api_key: str = Field(unique=True, index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    tier: str = Field(default="hobby")

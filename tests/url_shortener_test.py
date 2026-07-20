@@ -16,12 +16,17 @@ def _get_url_row(code: str) -> Url | None:
         return session.exec(select(Url).where(Url.short_code == code)).first()
 
 
-def _get_test_user(email: str) -> User:
+def _get_test_user(email: str, tier: str = "hobby") -> User:
     """Fetch-or-create a test user; the api_key is stable across runs."""
     with get_session() as session:
         user = session.exec(select(User).where(User.email == email)).first()
         if user is None:
-            user = User(email=email, name="Test User", api_key=f"test-{uuid.uuid4().hex}")
+            user = User(email=email, name="Test User", api_key=f"test-{uuid.uuid4().hex}", tier=tier)
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+        elif user.tier != tier:
+            user.tier = tier
             session.add(user)
             session.commit()
             session.refresh(user)
@@ -343,6 +348,364 @@ def test_omitted_code_still_autogenerates():
     response = client.post("/shorten", json={"url": "https://example.com"})
     assert response.status_code == 200
     assert len(response.json()["short_url"]) == 6  # generated, not custom
+
+
+def test_batch_shorten_all_succeed():
+    user = _get_test_user("enterprise@test.com", tier="enterprise")
+    urls = [f"https://example.com/{uuid.uuid4()}" for _ in range(3)]
+    response = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": u} for u in urls]},
+        headers={"X-API-Key": user.api_key},
+    )
+    assert response.status_code == 200
+
+    results = response.json()["results"]
+    assert len(results) == 3
+    for original, result in zip(urls, results):
+        assert result["error"] is None
+        assert result["short_url"]
+        redirect = client.get(f"/redirect?code={result['short_url']}", follow_redirects=False)
+        assert redirect.status_code == 307
+        assert redirect.headers["location"].rstrip("/") == original
+
+
+def test_batch_shorten_partial_failure():
+    """One item has a taken custom code — it fails, the others still succeed."""
+    user = _get_test_user("enterprise@test.com", tier="enterprise")
+    taken = f"taken-{uuid.uuid4().hex[:8]}"
+    client.post("/shorten", json={"url": "https://example.com", "code": taken})
+
+    urls = [
+        {"url": f"https://example.com/{uuid.uuid4()}"},
+        {"url": f"https://example.com/{uuid.uuid4()}", "code": taken},   # will fail
+        {"url": f"https://example.com/{uuid.uuid4()}"},
+    ]
+    response = client.post(
+        "/shorten/batch", json={"urls": urls}, headers={"X-API-Key": user.api_key}
+    )
+    assert response.status_code == 200
+
+    results = response.json()["results"]
+    assert results[0]["error"] is None and results[0]["short_url"]
+    assert results[1]["error"] == "Short code already exists" and results[1]["short_url"] is None
+    assert results[2]["error"] is None and results[2]["short_url"]
+
+
+def test_batch_shorten_malformed_item_rejects_whole_request():
+    """Schema-level validation is all-or-nothing: one bad URL 422s the batch."""
+    response = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": "https://example.com"}, {"url": "not-a-url"}]},
+    )
+    assert response.status_code == 422
+
+
+def test_batch_shorten_empty_list_rejected():
+    response = client.post("/shorten/batch", json={"urls": []})
+    assert response.status_code == 422
+
+
+def test_batch_shorten_too_many_items_rejected():
+    urls = [{"url": "https://example.com"}] * 101
+    response = client.post("/shorten/batch", json={"urls": urls})
+    assert response.status_code == 422
+
+
+def test_batch_shorten_links_owner():
+    user = _get_test_user("enterprise@test.com", tier="enterprise")
+    response = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": f"https://example.com/{uuid.uuid4()}"}]},
+        headers={"X-API-Key": user.api_key},
+    )
+    code = response.json()["results"][0]["short_url"]
+    assert _get_url_row(code).user_id == user.id
+
+
+def test_batch_shorten_requires_enterprise_tier():
+    """A hobby-tier user (the default) cannot use bulk creation."""
+    user = _get_test_user("hobby@test.com", tier="hobby")
+    response = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": "https://example.com"}]},
+        headers={"X-API-Key": user.api_key},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Bulk creation requires the enterprise tier"
+
+
+def test_batch_shorten_requires_api_key():
+    """No API key at all — bulk creation must not silently run anonymously."""
+    response = client.post("/shorten/batch", json={"urls": [{"url": "https://example.com"}]})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "API key required"
+
+
+def test_enterprise_tier_grants_access_after_manual_upgrade():
+    """Simulates the client's manual DB update: hobby -> enterprise unlocks batch."""
+    user = _get_test_user("upgrade-me@test.com", tier="hobby")
+
+    denied = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": "https://example.com"}]},
+        headers={"X-API-Key": user.api_key},
+    )
+    assert denied.status_code == 403
+
+    with get_session() as session:
+        db_user = session.exec(select(User).where(User.id == user.id)).first()
+        db_user.tier = "enterprise"
+        session.add(db_user)
+        session.commit()
+
+    allowed = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": "https://example.com"}]},
+        headers={"X-API-Key": user.api_key},
+    )
+    assert allowed.status_code == 200
+
+
+def test_owner_can_edit_destination_url():
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    new_url = f"https://example.com/new-{uuid.uuid4()}"
+
+    response = client.put(f"/urls/{code}", json={"url": new_url}, headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+
+    redirect = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert redirect.status_code == 307
+    assert redirect.headers["location"].rstrip("/") == new_url
+
+
+def test_edit_expiry_only_leaves_url_untouched():
+    user = _get_test_user("owner@test.com")
+    original_url = f"https://example.com/{uuid.uuid4()}"
+    code = _shorten(original_url, user.api_key)
+    future = (datetime.utcnow() + timedelta(days=1)).isoformat()
+
+    response = client.put(f"/urls/{code}", json={"expires_at": future}, headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+    assert _get_url_row(code).original_url.rstrip("/") == original_url
+
+
+def test_edit_past_expiry_deactivates_link():
+    """The client-requested feature: past expiry via edit == deactivation."""
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    past = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+
+    response = client.put(f"/urls/{code}", json={"expires_at": past}, headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+
+    redirect = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert redirect.status_code == 410
+
+
+def test_edit_can_reactivate_expired_link():
+    """Clearing expiry (explicit null) brings a deactivated link back."""
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    _expire_link(code)
+    assert client.get(f"/redirect?code={code}", follow_redirects=False).status_code == 410
+
+    response = client.put(f"/urls/{code}", json={"expires_at": None}, headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+
+    redirect = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert redirect.status_code == 307
+
+
+def test_edit_extending_expiry_reactivates_link():
+    """Setting a future expiry also brings a deactivated link back."""
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    _expire_link(code)
+
+    future = (datetime.utcnow() + timedelta(days=1)).isoformat()
+    response = client.put(f"/urls/{code}", json={"expires_at": future}, headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+    assert client.get(f"/redirect?code={code}", follow_redirects=False).status_code == 307
+
+
+def test_non_owner_cannot_edit():
+    owner = _get_test_user("owner@test.com")
+    intruder = _get_test_user("intruder@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", owner.api_key)
+
+    response = client.put(
+        f"/urls/{code}",
+        json={"url": "https://example.com/hijacked"},
+        headers={"X-API-Key": intruder.api_key},
+    )
+    assert response.status_code == 403
+
+
+def test_edit_without_api_key_returns_401():
+    owner = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", owner.api_key)
+
+    response = client.put(f"/urls/{code}", json={"url": "https://example.com/x"})
+    assert response.status_code == 401
+
+
+def test_edit_unknown_code_returns_404():
+    user = _get_test_user("owner@test.com")
+    response = client.put(
+        "/urls/nonexistent123",
+        json={"url": "https://example.com"},
+        headers={"X-API-Key": user.api_key},
+    )
+    assert response.status_code == 404
+
+
+def test_edit_deleted_code_returns_404():
+    """A soft-deleted code is not editable — deletion stays the irreversible path."""
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    client.delete(f"/urls/{code}", headers={"X-API-Key": user.api_key})
+
+    response = client.put(
+        f"/urls/{code}",
+        json={"url": "https://example.com/x"},
+        headers={"X-API-Key": user.api_key},
+    )
+    assert response.status_code == 404
+
+
+def test_edit_empty_body_rejected():
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+
+    response = client.put(f"/urls/{code}", json={}, headers={"X-API-Key": user.api_key})
+    assert response.status_code == 422
+
+
+def test_shorten_without_password_is_unaffected():
+    """Baseline: links with no password behave exactly as before."""
+    code = _shorten(f"https://example.com/{uuid.uuid4()}")
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 307
+
+
+def test_password_too_short_rejected_on_create():
+    response = client.post(
+        "/shorten", json={"url": "https://example.com", "password": "abc"}
+    )
+    assert response.status_code == 422
+
+
+def test_edit_password_too_short_rejected():
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+
+    response = client.put(
+        f"/urls/{code}", json={"password": "abc"}, headers={"X-API-Key": user.api_key}
+    )
+    assert response.status_code == 422
+
+
+def test_redirect_without_password_is_rejected_when_one_is_set():
+    """No password given on a paywalled code -> 401, not a crash."""
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    client.put(f"/urls/{code}", json={"password": "secret1"}, headers={"X-API-Key": user.api_key})
+
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Password required"
+
+
+def test_redirect_with_correct_password_succeeds():
+    user = _get_test_user("owner@test.com")
+    original_url = f"https://example.com/{uuid.uuid4()}"
+    response = client.post(
+        "/shorten",
+        json={"url": original_url, "password": "secret1"},
+        headers={"X-API-Key": user.api_key},
+    )
+    code = response.json()["short_url"]
+
+    redirect = client.get(f"/redirect?code={code}&password=secret1", follow_redirects=False)
+    assert redirect.status_code == 307
+    assert redirect.headers["location"].rstrip("/") == original_url
+
+
+def test_redirect_with_wrong_password_returns_401_and_does_not_increment():
+    user = _get_test_user("owner@test.com")
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com", "password": "secret1"},
+        headers={"X-API-Key": user.api_key},
+    )
+    code = response.json()["short_url"]
+
+    redirect = client.get(f"/redirect?code={code}&password=wrongpass", follow_redirects=False)
+    assert redirect.status_code == 401
+    assert _get_url_row(code).click_count == 0
+
+
+def test_deleted_password_protected_code_returns_404_not_401():
+    """Existence must not leak through the paywall: deleted -> 404, never 401."""
+    user = _get_test_user("owner@test.com")
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com", "password": "secret1"},
+        headers={"X-API-Key": user.api_key},
+    )
+    code = response.json()["short_url"]
+    client.delete(f"/urls/{code}", headers={"X-API-Key": user.api_key})
+
+    redirect = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert redirect.status_code == 404
+
+
+def test_expired_password_protected_code_returns_410_not_401():
+    """Liveness must be checked before the paywall: expired -> 410, never 401."""
+    user = _get_test_user("owner@test.com")
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com", "password": "secret1"},
+        headers={"X-API-Key": user.api_key},
+    )
+    code = response.json()["short_url"]
+    _expire_link(code)
+
+    redirect = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert redirect.status_code == 410
+
+
+def test_edit_can_add_password_to_existing_link():
+    user = _get_test_user("owner@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+    assert client.get(f"/redirect?code={code}", follow_redirects=False).status_code == 307
+
+    response = client.put(
+        f"/urls/{code}", json={"password": "secret1"}, headers={"X-API-Key": user.api_key}
+    )
+    assert response.status_code == 200
+    assert client.get(f"/redirect?code={code}", follow_redirects=False).status_code == 401
+
+
+def test_edit_can_clear_password_via_null():
+    user = _get_test_user("owner@test.com")
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com", "password": "secret1"},
+        headers={"X-API-Key": user.api_key},
+    )
+    code = response.json()["short_url"]
+    assert client.get(f"/redirect?code={code}", follow_redirects=False).status_code == 401
+
+    edit = client.put(
+        f"/urls/{code}", json={"password": None}, headers={"X-API-Key": user.api_key}
+    )
+    assert edit.status_code == 200
+
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 307
 
 
 def test_invalid_url_rejected():

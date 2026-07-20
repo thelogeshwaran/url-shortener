@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header
 
 from app.repositories import UrlRepository, UserRepository
-from app.schemas import ShortenRequest, ShortenResponse
+from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest
 from app.service import UrlService, UserService
 from app.models import User
 
@@ -38,9 +38,18 @@ def shorten(
     return ShortenResponse(short_url=code)
 
 
+@router.post('/shorten/batch')
+def batchShorten(
+    request: BatchShortenRequest,
+    service: Annotated[UrlService, Depends(get_service)],
+    user: Annotated[User | None, Depends(get_current_user)]
+) -> BatchShortenResponse:
+    return service.batchShorten(request, user)
+
+
 @router.get('/redirect')
-def redirect(code: str, service: Annotated[UrlService, Depends(get_service)]):
-    return service.redirect(code)
+def redirect(code: str, service: Annotated[UrlService, Depends(get_service)], password: str | None = None):
+    return service.redirect(code, password)
 
 
 @router.delete('/urls/{code}', status_code=204)
@@ -50,3 +59,13 @@ def delete_url(
     user: Annotated[User | None, Depends(get_current_user)]
 ) -> None:
     service.delete_url(code, user)
+
+@router.put('/urls/{code}')
+def edit_url(
+    code: str, 
+    request: EditUrlRequest, 
+    service: Annotated[UrlService, Depends(get_service)],
+    user: Annotated[User | None, Depends(get_current_user)]) -> None:
+    return service.edit_url(code, request, user)
+
+

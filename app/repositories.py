@@ -6,9 +6,22 @@ from app.models import Url, User
 
 
 class UrlRepository: 
-    def save_url(self, code: str, long_url: str, user_id: int | None = None, expires_at: datetime | None = None) -> None:
+    def save_url(
+        self,
+        code: str,
+        long_url: str,
+        user_id: int | None = None,
+        expires_at: datetime | None = None,
+        password_hash: str | None = None
+    ) -> None:
         with get_session() as session:
-            session.add(Url(short_code=code, original_url=long_url, user_id=user_id, expires_at=expires_at))
+            session.add(Url(
+                short_code=code,
+                original_url=long_url,
+                user_id=user_id,
+                expires_at=expires_at,
+                password_hash=password_hash
+            ))
             session.commit()
 
     def get_url_by_code(self, code: str) -> Url | None:
@@ -16,6 +29,16 @@ class UrlRepository:
             stmt = select(Url).where(Url.short_code == code)
             url = session.exec(stmt).first()
             return url
+    
+    def update_url(self, code: str, changes: dict) -> bool:
+        with get_session() as session:
+            stmt = (update(Url)
+                    .where(Url.short_code == code, Url.deleted_at == None)
+                    .values(**changes)
+                    .returning(Url.id))
+            result = session.exec(stmt).first()
+            session.commit()
+            return result is not None
           
     def delete_url(self, code: str) -> bool:
         with get_session() as session:

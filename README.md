@@ -14,9 +14,29 @@ A simple URL shortener built with **Python, FastAPI, SQLModel, and SQLite/Postgr
 
 | Method   | Endpoint               | Description                                                        |
 |----------|------------------------|--------------------------------------------------------------------|
-| `POST`   | `/shorten`             | Body `{"url": "https://..."}` → `{"short_url": "<code>"}`. One URL can have many codes. |
-| `GET`    | `/redirect?code={code}` | `307` redirect to the original URL. Increments `click_count` and updates `last_accessed_at`. `404` if unknown. |
-| `DELETE` | `/urls/{code}`         | Deletes the mapping. `204` on success, `404` if unknown.           |
+| `POST`   | `/shorten`             | Body `{"url": "https://...", "code": "custom" \| null, "expires_at": "<ISO-8601>" \| null}` → `{"short_url": "<code>"}`. One URL can have many codes. `code` optional (`409` if already taken); `expires_at` optional and must be in the future (`422` otherwise). |
+| `POST`   | `/shorten/batch`       | Body `{"urls": [{...shorten fields...}, ...]}` (1–100 items) → `{"results": [{"url", "short_url", "error"}, ...]}`, one entry per input in order. A malformed item `422`s the whole request; a business failure (e.g. taken custom code) only fails that item — the rest still succeed. |
+| `GET`    | `/redirect?code={code}` | `307` redirect to the original URL. Increments `click_count` and updates `last_accessed_at`. `404` if unknown or deleted, `410` if expired. |
+| `DELETE` | `/urls/{code}`         | Soft-deletes the mapping (row is kept, `deleted_at` is stamped). `204` on success, `401` if no API key, `403` if the code belongs to another user, `404` if unknown. |
+
+### Authentication
+
+`/shorten` and `/shorten/batch` accept an optional `X-API-Key` header:
+
+```bash
+curl -X POST http://127.0.0.1:8000/shorten \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <your-api-key>" \
+  -d '{"url": "https://example.com"}'
+```
+
+- **No header** — the link is created anonymously (`user_id` is `NULL`).
+- **Valid key** — the link is owned by that user; only the owner (or any
+  authenticated user, for pre-existing anonymous links) can delete it.
+- **Unknown key** — `401 Invalid API key`.
+
+Sample users with their keys are created by `python seed_users.py` (see
+Configuration for pointing it at a specific database).
 
 ### Click Tracking
 
