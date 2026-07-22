@@ -395,21 +395,31 @@ def test_batch_shorten_partial_failure():
 
 def test_batch_shorten_malformed_item_rejects_whole_request():
     """Schema-level validation is all-or-nothing: one bad URL 422s the batch."""
+    user = _get_test_user("enterprise@test.com", tier="enterprise")
     response = client.post(
         "/shorten/batch",
         json={"urls": [{"url": "https://example.com"}, {"url": "not-a-url"}]},
+        headers={"X-API-Key": user.api_key},
     )
     assert response.status_code == 422
 
 
 def test_batch_shorten_empty_list_rejected():
-    response = client.post("/shorten/batch", json={"urls": []})
+    """Auth runs before body validation, so an authenticated request is
+    needed here to actually exercise the 422 payload check."""
+    user = _get_test_user("enterprise@test.com", tier="enterprise")
+    response = client.post(
+        "/shorten/batch", json={"urls": []}, headers={"X-API-Key": user.api_key}
+    )
     assert response.status_code == 422
 
 
 def test_batch_shorten_too_many_items_rejected():
+    user = _get_test_user("enterprise@test.com", tier="enterprise")
     urls = [{"url": "https://example.com"}] * 101
-    response = client.post("/shorten/batch", json={"urls": urls})
+    response = client.post(
+        "/shorten/batch", json={"urls": urls}, headers={"X-API-Key": user.api_key}
+    )
     assert response.status_code == 422
 
 
@@ -440,7 +450,7 @@ def test_batch_shorten_requires_api_key():
     """No API key at all — bulk creation must not silently run anonymously."""
     response = client.post("/shorten/batch", json={"urls": [{"url": "https://example.com"}]})
     assert response.status_code == 401
-    assert response.json()["detail"] == "API key required"
+    assert response.json()["detail"] == "Unauthorized"
 
 
 def test_enterprise_tier_grants_access_after_manual_upgrade():
@@ -768,7 +778,10 @@ def test_list_urls_returns_only_own_urls():
     _shorten(owner_url, owner.api_key)
     _shorten(other_url, other.api_key)
 
-    response = client.get("/urls", headers={"X-API-Key": owner.api_key})
+    # size=1000: this test user accumulates URLs across every run of this
+    # suite (a shared, never-reset urls.db), so the default page size can't
+    # be trusted to include the URL just created above.
+    response = client.get("/urls?size=1000", headers={"X-API-Key": owner.api_key})
     assert response.status_code == 200
 
     body = response.json()
@@ -869,3 +882,58 @@ def test_health_check_does_not_leak_internal_error_details():
     assert "postgres" not in response.text
     assert "10.0.0.5" not in response.text
     assert "password" not in response.text
+
+
+def test_health_exempt_from_api_key_check():
+    response = client.get("/health")
+    assert response.status_code == 200
+
+
+def test_redirect_exempt_from_api_key_check():
+    """Redirect links are public — clicking one must never require an API key."""
+    code = _shorten(f"https://example.com/{uuid.uuid4()}")
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 307
+
+
+def test_shorten_exempt_allows_anonymous_request():
+    response = client.post("/shorten", json={"url": "https://example.com"})
+    assert response.status_code == 200
+
+
+def test_shorten_with_invalid_key_returns_401():
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com"},
+        headers={"X-API-Key": "totally-invalid-key"},
+    )
+    assert response.status_code == 401
+
+
+def test_protected_route_without_key_returns_401():
+    response = client.get("/urls")
+    assert response.status_code == 401
+
+
+def test_protected_route_with_invalid_key_returns_401():
+    response = client.get("/urls", headers={"X-API-Key": "totally-invalid-key"})
+    assert response.status_code == 401
+
+
+def test_protected_route_with_valid_key_succeeds():
+    user = _get_test_user("auth-mw@test.com")
+    response = client.get("/urls", headers={"X-API-Key": user.api_key})
+    assert response.status_code == 200
+
+
+def test_invalid_key_short_circuits_before_service_logic():
+    """
+    A delete on a NONEXISTENT code with an invalid key must still be 401,
+    not 404 — proving the middleware rejected the request before the
+    service layer ever checked whether the code exists.
+    """
+    response = client.delete(
+        "/urls/this-code-does-not-exist-at-all",
+        headers={"X-API-Key": "totally-invalid-key"},
+    )
+    assert response.status_code == 401

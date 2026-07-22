@@ -23,10 +23,6 @@ class UrlService:
         return code
     
     def batchShorten(self, request: BatchShortenRequest, user: User | None) -> BatchShortenResponse:
-        if user is None:
-            raise HTTPException(status_code=401, detail='API key required')
-        if user.tier != 'enterprise':
-            raise HTTPException(status_code=403, detail='Bulk creation requires the enterprise tier')
         results = []
         for req in request.urls:
             try:
@@ -37,8 +33,6 @@ class UrlService:
         return BatchShortenResponse(results=results)
 
     def delete_url(self, code: str, user: User | None) -> None:
-        if user is None:
-            raise HTTPException(status_code=401, detail='API key required')
         url = self.repository.get_url_by_code(code)
         if url and url.user_id is not None and url.user_id != user.id:
             raise HTTPException(status_code=403, detail='You are not authorized to delete this URL')
@@ -71,8 +65,6 @@ class UrlService:
         raise HTTPException(status_code=404, detail='Short code not found')
 
     def edit_url(self, code: str, request: EditUrlRequest, user: User | None) -> None:
-        if user is None:
-            raise HTTPException(status_code=401, detail='API key required')
         url = self.repository.get_url_by_code(code)
         if url and url.user_id is not None and url.user_id != user.id:
             raise HTTPException(status_code=403, detail='You are not authorized to edit this URL')
