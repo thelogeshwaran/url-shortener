@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -20,16 +20,19 @@ def get_service() -> UrlService:
 def get_user_service() -> UserService:
     return UserService(UserRepository())
 
-
+    
 def get_current_user(
+    request: Request,
     user_service: Annotated[UserService, Depends(get_user_service)],
-    x_api_key: Annotated[str | None, Header(...)] = None
-): 
+    x_api_key: Annotated[str | None, Header(...)] = None,
+):
+    state_user = getattr(request.state, "user", None)
+    if state_user is not None:
+        return state_user
     if not x_api_key:
         return None
-    user = user_service.get_user_by_api_key(x_api_key)
-    return user
-    
+    return user_service.get_user_by_api_key(x_api_key)
+
 
 @router.post('/shorten', response_model=ShortenResponse)
 def shorten(
@@ -68,8 +71,9 @@ def delete_url(
 def edit_url(
     code: str, 
     request: EditUrlRequest, 
-    service: Annotated[UrlService, Depends(get_service)],
-    user: Annotated[User | None, Depends(get_current_user)]) -> None:
+    service: Annotated[UrlService, Depends(get_service)], 
+    user: Annotated[User | None, Depends(get_current_user)]
+) -> None:
     return service.edit_url(code, request, user)
 
 
