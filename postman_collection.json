@@ -1,0 +1,148 @@
+{
+  "info": {
+    "name": "URL Shortener API",
+    "description": "A URL shortener supporting anonymous or API-key-owned links, custom codes, expiry (with reactivate/deactivate via edit), password-protected redirects, bulk creation (enterprise tier only), and paginated listing of a user's own links.\n\n### Auth model\nMost endpoints require an `X-API-Key` header. Two exceptions:\n- `POST /shorten` — optional. Omit it to create an anonymous link; send a valid key to become its owner.\n- `GET /redirect` and `GET /health` — never require a key; these are public.\n\nSet the `apiKey` collection variable below to avoid repeating it per request. Sample keys can be generated locally via `python seed_users.py`.\n\n### Status codes used across this API\n- `401` — missing or invalid API key (or, on `/redirect`, missing/wrong password on a protected link)\n- `403` — valid key, but not the owner of this resource / wrong tier for this feature\n- `404` — code doesn't exist, or has been deleted\n- `409` — requested custom code is already taken\n- `410` — code exists but has expired\n- `422` — request body failed validation",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8000", "type": "string" },
+    { "key": "apiKey", "value": "", "type": "string" },
+    { "key": "shortCode", "value": "", "type": "string", "description": "Set this after running 'Shorten a URL' so the Manage Links / Redirect requests below have a real code to act on." }
+  ],
+  "item": [
+    {
+      "name": "Shorten",
+      "item": [
+        {
+          "name": "Shorten a URL",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{apiKey}}", "description": "Optional. Omit for an anonymous link.", "disabled": true }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://example.com\",\n  \"code\": null,\n  \"expires_at\": null,\n  \"password\": null\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": { "raw": "{{baseUrl}}/shorten", "host": ["{{baseUrl}}"], "path": ["shorten"] },
+            "description": "Create a short code for a URL.\n\n- `url` (required) — must be a valid URL.\n- `code` (optional) — request a custom code instead of an auto-generated one. `409` if already taken.\n- `expires_at` (optional) — ISO-8601 datetime; must be in the future. Link starts returning `410` after this time.\n- `password` (optional, min 4 chars) — paywalls the redirect; bcrypt-hashed at rest, never returned by any endpoint.\n\nSending the same `url` twice creates two independent codes — codes are not deduplicated per URL.\n\n**Responses:** `200` success · `409` custom code taken · `422` validation failed · `401` API key provided but invalid."
+          },
+          "response": []
+        },
+        {
+          "name": "Shorten in Bulk (enterprise only)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{apiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"urls\": [\n    { \"url\": \"https://example.com/a\" },\n    { \"url\": \"https://example.com/b\", \"code\": \"my-custom-code\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": { "raw": "{{baseUrl}}/shorten/batch", "host": ["{{baseUrl}}"], "path": ["shorten", "batch"] },
+            "description": "Shorten 1–100 URLs in a single request. Requires a valid API key **and** the caller's account must be on the `enterprise` tier.\n\nEach item accepts the same fields as `POST /shorten`. A malformed item (e.g. invalid URL) fails schema validation for the *entire* request (`422`). A business-level failure on one item (e.g. a taken custom code) only fails that item — the response lists every item's outcome individually, and the rest still succeed.\n\n**Responses:** `200` with a per-item `results` array (`short_url` or `error` each) · `401` missing/invalid key · `403` not on the enterprise tier · `422` empty list, >100 items, or a malformed item."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Redirect",
+      "item": [
+        {
+          "name": "Redirect to Original URL",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/redirect?code={{shortCode}}&password=",
+              "host": ["{{baseUrl}}"],
+              "path": ["redirect"],
+              "query": [
+                { "key": "code", "value": "{{shortCode}}", "description": "Required." },
+                { "key": "password", "value": "", "description": "Required only if the link was created with a password.", "disabled": false }
+              ]
+            },
+            "description": "Publicly accessible — no API key needed. Increments `click_count` and updates `last_accessed_at` on every successful redirect.\n\n**Responses:** `307` redirect to the original URL · `404` unknown or deleted code · `410` expired code · `401` password required or wrong (a failed password attempt does not increment the click count)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Manage Links",
+      "item": [
+        {
+          "name": "Edit a Link",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{apiKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"expires_at\": null\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": { "raw": "{{baseUrl}}/urls/{{shortCode}}", "host": ["{{baseUrl}}"], "path": ["urls", "{{shortCode}}"] },
+            "description": "Partial update — at least one of `url`, `expires_at`, `password` must be present.\n\n- Omitting a field leaves it unchanged.\n- Sending a field as `null` explicitly clears it (e.g. `\"password\": null` removes a paywall; `\"expires_at\": null` reactivates an expired/deactivated link).\n- Setting `expires_at` to a past timestamp deactivates the link immediately (same effect as expiry, reversible by editing again).\n\nRequires a valid API key. A link with no owner (created anonymously) can be edited by any authenticated user; an owned link can only be edited by its owner.\n\n**Responses:** `200` updated · `401` missing/invalid key · `403` not the owner · `404` unknown or deleted code · `422` no fields provided."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete a Link",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" }
+            ],
+            "url": { "raw": "{{baseUrl}}/urls/{{shortCode}}", "host": ["{{baseUrl}}"], "path": ["urls", "{{shortCode}}"] },
+            "description": "Soft-deletes the link — the row and its short code are retained (the code can never be reissued), but it immediately stops redirecting.\n\nSame ownership rule as editing: any authenticated user may delete an unowned (anonymous) link; an owned link can only be deleted by its owner.\n\n**Responses:** `204` deleted · `401` missing/invalid key · `403` not the owner · `404` unknown or already-deleted code."
+          },
+          "response": []
+        },
+        {
+          "name": "List My Links",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/urls?page=1&size=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["urls"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "size", "value": "10" }
+              ]
+            },
+            "description": "Paginated list of the authenticated caller's own links only — never includes other users' links, and never returns password hashes.\n\n**Responses:** `200` with `{ urls: [...], total, page, size }` · `401` missing/invalid key."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] },
+            "description": "Publicly accessible — intended for uptime monitors / orchestration probes, not application traffic. Reports whether the database is reachable, separate from whether the process is merely alive.\n\n**Responses:** `200 { status: \"ok\", database: \"ok\" }` · `503 { status: \"error\", database: \"unreachable\" }` if the database can't be reached."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
