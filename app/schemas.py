@@ -95,3 +95,7 @@ class PaginatedUrlsResponse(BaseModel):
     total: int
     page: int
     size: int
+
+
+class LookupResponse(BaseModel):
+    url: str

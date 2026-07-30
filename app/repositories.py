@@ -74,6 +74,24 @@ class UrlRepository:
             session.commit()
             return result[0] if result else None
     
+    def increment_click_stats(self, code: str, delta: int, last_accessed_at: datetime) -> None:
+        """Flush an accumulated in-memory click delta to the database.
+        Called from the periodic cache flush, not from a live request."""
+        with get_session() as session:
+            stmt = (
+                update(Url)
+                .where(Url.short_code == code, Url.deleted_at == None, or_(
+                    Url.expires_at.is_(None),
+                    Url.expires_at > datetime.now(timezone.utc)
+                ))
+                .values(
+                    click_count=Url.click_count + delta,
+                    last_accessed_at=last_accessed_at,
+                )
+            )
+            session.exec(stmt)
+            session.commit()
+
     def list_urls_by_user(self, user_id: int, page: int, size: int) -> list[Url]:
         with get_session() as session:
             stmt = select(Url).where(Url.user_id == user_id).offset((page - 1) * size).limit(size)

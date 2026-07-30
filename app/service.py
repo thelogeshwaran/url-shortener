@@ -7,6 +7,7 @@ from app.models import User
 from app.schemas import ShortenRequest, BatchShortenRequest, BatchShortenResponse, BatchItemResult, EditUrlRequest, PaginatedUrlsResponse
 from datetime import datetime
 from bcrypt import hashpw, gensalt, checkpw
+from app import cache
 
 class UrlService:
     def __init__(self, repository: UrlRepository):
@@ -36,13 +37,44 @@ class UrlService:
         url = self.repository.get_url_by_code(code)
         if url and url.user_id is not None and url.user_id != user.id:
             raise HTTPException(status_code=403, detail='You are not authorized to delete this URL')
+        cache.invalidate(code)
         deleted = self.repository.delete_url(code)
         if not deleted:
             raise HTTPException(status_code=404, detail='Short code not found')
 
     def redirect(self, code: str, password):
+        cached = cache.get(code)
+        if cached:
+            self._check_redirect_validity(cached, password)
+            cache.record_hit(code)  # in-memory only -- no DB call on a cache hit
+            return responses.RedirectResponse(url=cached.original_url)
+
         url = self.repository.get_url_by_code(code)
-        
+        self._check_redirect_validity(url, password)
+        if url:
+            cache.set(code, url.original_url, url.expires_at, url.deleted_at, url.password_hash, url.user_id)
+
+        original_url = self.repository.update_click_stats(code)
+        if original_url:
+            return responses.RedirectResponse(url=original_url)
+        raise HTTPException(status_code=404, detail='Short code not found')
+
+    def lookup(self, code: str) -> str:
+        """Plain code -> URL fetch, no redirect, no click tracking, no
+        expiry/deleted/password checks. Exists to isolate cache
+        performance measurements to a single DB read per miss, separate
+        from /redirect's extra click-tracking write."""
+        cached = cache.get(code)
+        if cached:
+            return cached.original_url
+
+        url = self.repository.get_url_by_code(code)
+        if url is None:
+            raise HTTPException(status_code=404, detail='Short code not found')
+        cache.set(code, url.original_url, url.expires_at, url.deleted_at, url.password_hash, url.user_id)
+        return url.original_url
+
+    def _check_redirect_validity(self, url, password) -> None:
         if (
             url is not None
             and url.deleted_at is None
@@ -51,7 +83,7 @@ class UrlService:
         ):
             raise HTTPException(status_code=410, detail='Short code expired')
 
-        if (url and url.deleted_at):
+        if url and url.deleted_at:
             raise HTTPException(status_code=404, detail='Short code not found')
         if url and url.password_hash and not password:
             raise HTTPException(status_code=401, detail='Password required')
@@ -59,17 +91,13 @@ class UrlService:
             if not checkpw(password.encode('utf-8'), url.password_hash.encode('utf-8')):
                 raise HTTPException(status_code=401, detail='Invalid password')
 
-        original_url = self.repository.update_click_stats(code)
-        if original_url:
-            return responses.RedirectResponse(url=original_url)
-        raise HTTPException(status_code=404, detail='Short code not found')
-
     def edit_url(self, code: str, request: EditUrlRequest, user: User | None) -> None:
         url = self.repository.get_url_by_code(code)
         if url and url.user_id is not None and url.user_id != user.id:
             raise HTTPException(status_code=403, detail='You are not authorized to edit this URL')
 
         changes = request.model_dump(exclude_unset=True)
+        cache.invalidate(code)
         if 'url' in changes:
             changes['original_url'] = str(changes.pop('url'))
         if 'password' in changes:

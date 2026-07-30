@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 from app.database import get_session
 from app.repositories import UrlRepository, UserRepository
-from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest, PaginatedUrlsResponse
+from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest, PaginatedUrlsResponse, LookupResponse
 from app.service import UrlService, UserService
 from app.models import User
 
@@ -77,7 +77,14 @@ def edit_url(
     return service.edit_url(code, request, user)
 
 
-@router.get('/urls')   
+@router.get('/lookup', response_model=LookupResponse)
+def lookup(code: str, service: Annotated[UrlService, Depends(get_service)]) -> LookupResponse:
+    """Benchmarking utility: fetch the URL for a code without redirecting,
+    tracking clicks, or checking expiry/deleted/password status."""
+    return LookupResponse(url=service.lookup(code))
+
+
+@router.get('/urls')
 def get_all_urls_by_user(
     service: Annotated[UrlService, Depends(get_service)],
     user: Annotated[User | None, Depends(get_current_user)],

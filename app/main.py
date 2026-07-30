@@ -1,6 +1,9 @@
 """Main module for the URL shortener FastAPI application."""
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
+from app import cache
 from app.middleware.logging import log_requests
 from app.middleware.blacklist import blacklist
 from app.middleware.auth import check_api_key
@@ -10,7 +13,14 @@ from app.routers import router
 from app.middleware.timed import timed
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cache.start_periodic_flush()
+    yield
+    await cache.stop_periodic_flush()
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.middleware("http")(timed(authorization))
 

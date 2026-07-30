@@ -8,7 +8,8 @@ from app.service import UserService
 exclued_path = [
     "/health",
     "/shorten",
-    "/redirect"
+    "/redirect",
+    "/lookup"
 ]
 
 
