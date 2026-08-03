@@ -1,27 +1,38 @@
-"""In-memory cache for short_code -> redirect target, with write-behind
-click tracking: a cache hit increments an in-memory delta instead of
-writing to the database immediately; a periodic background task flushes
-accumulated deltas to the database on an interval.
+"""Redis-backed cache for short_code -> redirect target, with write-behind
+click tracking: a cache hit increments a counter atomically in Redis
+instead of writing to the database immediately; a periodic background
+task flushes accumulated deltas to the database on an interval.
 
-Trade-offs accepted for this exercise:
-- Lost on server restart (no persistence).
-- Per-process only -- not shared across multiple worker processes.
-- Clicks accumulated since the last flush are lost on a hard crash (a
-  graceful shutdown does one final flush to minimize this).
-- The increment below isn't lock-protected; a lost increment under heavy
-  concurrent hits on the exact same code is a theoretical, accepted risk
-  for this exercise.
+Unlike the in-memory dict this replaces, the cache now survives a server
+restart (Redis is a separate, persistent process), and click increments
+are atomic at the Redis level (HINCRBY), removing the small race the
+in-memory version had to accept under concurrent hits on the same code.
+
+Trade-offs still accepted for this exercise:
+- If Redis itself is unreachable, cache operations degrade to "always a
+  miss" (fall through to the DB) rather than crashing the request -- the
+  failure is logged, not silent.
+- Clicks accumulated since the last flush are lost if Redis's own data
+  is lost (e.g. no persistence configured on the Redis server itself) --
+  that's a Redis configuration concern, out of scope here.
 """
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
+
+import redis
 
 from app.repositories import UrlRepository
 
 logger = logging.getLogger('cache')
 
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
 FLUSH_INTERVAL_SECONDS = 30
+
+_redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+_flush_task: asyncio.Task | None = None
 
 
 @dataclass
@@ -35,12 +46,43 @@ class CacheEntry:
     last_accessed_at: datetime | None = None
 
 
-_cache: dict[str, CacheEntry] = {}
-_flush_task: asyncio.Task | None = None
+def _key(code: str) -> str:
+    return f'url:{code}'
+
+
+def _to_redis_hash(fields: dict) -> dict:
+    """Convert Python values to Redis-hash-safe strings, omitting None
+    fields entirely (a hash has no way to store None -- absence means it)."""
+    out = {}
+    for name, value in fields.items():
+        if value is None:
+            continue
+        out[name] = value.isoformat() if isinstance(value, datetime) else str(value)
+    return out
+
+
+def _from_redis_hash(raw: dict) -> CacheEntry:
+    def dt(field):
+        return datetime.fromisoformat(raw[field]) if field in raw else None
+
+    return CacheEntry(
+        original_url=raw['original_url'],
+        expires_at=dt('expires_at'),
+        deleted_at=dt('deleted_at'),
+        password_hash=raw.get('password_hash'),
+        user_id=int(raw['user_id']) if 'user_id' in raw else None,
+        click_count=int(raw.get('click_count', 0)),
+        last_accessed_at=dt('last_accessed_at'),
+    )
 
 
 def get(code: str) -> CacheEntry | None:
-    return _cache.get(code)
+    try:
+        raw = _redis.hgetall(_key(code))
+    except redis.RedisError:
+        logger.exception('Redis unavailable on get() -- treating as a cache miss')
+        return None
+    return _from_redis_hash(raw) if raw else None
 
 
 def set(
@@ -51,21 +93,32 @@ def set(
     password_hash: str | None,
     user_id: int | None,
 ) -> None:
-    _cache[code] = CacheEntry(
-        original_url=original_url,
-        expires_at=expires_at,
-        deleted_at=deleted_at,
-        password_hash=password_hash,
-        user_id=user_id,
-    )
+    fields = _to_redis_hash({
+        'original_url': original_url,
+        'expires_at': expires_at,
+        'deleted_at': deleted_at,
+        'password_hash': password_hash,
+        'user_id': user_id,
+    })
+    try:
+        key = _key(code)
+        _redis.delete(key)  # clear any stale fields before writing the fresh set
+        _redis.hset(key, mapping=fields)
+    except redis.RedisError:
+        logger.exception('Redis unavailable on set() -- cache write skipped')
 
 
 def record_hit(code: str) -> None:
-    """Increment the in-memory click delta for a cache hit -- no DB call."""
-    entry = _cache.get(code)
-    if entry is not None:
-        entry.click_count += 1
-        entry.last_accessed_at = datetime.utcnow()
+    """Atomically increment the pending click delta for a cache hit --
+    no DB call, and HINCRBY means no race even under concurrent hits."""
+    try:
+        key = _key(code)
+        if not _redis.exists(key):
+            return
+        _redis.hincrby(key, 'click_count', 1)
+        _redis.hset(key, 'last_accessed_at', datetime.utcnow().isoformat())
+    except redis.RedisError:
+        logger.exception('Redis unavailable on record_hit() -- click not recorded')
 
 
 def invalidate(code: str) -> None:
@@ -75,19 +128,53 @@ def invalidate(code: str) -> None:
     in its pre-change state -- increment_click_stats requires
     deleted_at IS NULL, which would no longer match once the row itself
     has already been deleted/edited."""
-    entry = _cache.pop(code, None)
-    if entry is not None and entry.click_count > 0:
-        UrlRepository().increment_click_stats(code, entry.click_count, entry.last_accessed_at)
+    key = _key(code)
+    try:
+        raw = _redis.hgetall(key)
+        _redis.delete(key)
+    except redis.RedisError:
+        logger.exception('Redis unavailable on invalidate()')
+        return
+
+    if raw:
+        pending = int(raw.get('click_count', 0))
+        if pending > 0:
+            last_accessed = (
+                datetime.fromisoformat(raw['last_accessed_at'])
+                if 'last_accessed_at' in raw else datetime.utcnow()
+            )
+            UrlRepository().increment_click_stats(code, pending, last_accessed)
 
 
 def flush_pending_clicks() -> None:
-    """Write every entry's accumulated click delta to the database and
-    reset it to zero. Safe to call even when nothing is pending."""
+    """Write every entry's accumulated click delta to the database.
+    Subtracts exactly what was flushed (HINCRBY by a negative amount)
+    rather than resetting to zero, so a click recorded in the gap
+    between reading and flushing isn't lost."""
+    try:
+        keys = list(_redis.scan_iter(match='url:*'))
+    except redis.RedisError:
+        logger.exception('Redis unavailable on flush_pending_clicks()')
+        return
+
     repository = UrlRepository()
-    for code, entry in list(_cache.items()):
-        if entry.click_count > 0:
-            repository.increment_click_stats(code, entry.click_count, entry.last_accessed_at)
-            entry.click_count = 0
+    for key in keys:
+        code = key.split(':', 1)[1]
+        try:
+            pending = int(_redis.hget(key, 'click_count') or 0)
+            if pending <= 0:
+                continue
+            last_accessed_raw = _redis.hget(key, 'last_accessed_at')
+        except redis.RedisError:
+            logger.exception('Redis unavailable while flushing %s', code)
+            continue
+
+        last_accessed = datetime.fromisoformat(last_accessed_raw) if last_accessed_raw else datetime.utcnow()
+        repository.increment_click_stats(code, pending, last_accessed)
+        try:
+            _redis.hincrby(key, 'click_count', -pending)
+        except redis.RedisError:
+            logger.exception('Redis unavailable resetting flushed count for %s', code)
 
 
 async def _periodic_flush_loop() -> None:

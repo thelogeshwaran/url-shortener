@@ -9,6 +9,13 @@ from datetime import datetime
 from bcrypt import hashpw, gensalt, checkpw
 from app import cache
 
+# Bounds how long a browser may serve a redirect without re-contacting the
+# server at all. Short deliberately: edits/deletes/expiry aren't visible to
+# the browser once cached, and click_count won't be incremented for any
+# repeat visit served straight from the browser's own cache.
+REDIRECT_CACHE_MAX_AGE_SECONDS = 300  # 5 minutes
+
+
 class UrlService:
     def __init__(self, repository: UrlRepository):
         self.repository = repository
@@ -47,7 +54,10 @@ class UrlService:
         if cached:
             self._check_redirect_validity(cached, password)
             cache.record_hit(code)  # in-memory only -- no DB call on a cache hit
-            return responses.RedirectResponse(url=cached.original_url)
+            return responses.RedirectResponse(
+                url=cached.original_url,
+                headers={"Cache-Control": f"public, max-age={REDIRECT_CACHE_MAX_AGE_SECONDS}"},
+            )
 
         url = self.repository.get_url_by_code(code)
         self._check_redirect_validity(url, password)
@@ -56,7 +66,10 @@ class UrlService:
 
         original_url = self.repository.update_click_stats(code)
         if original_url:
-            return responses.RedirectResponse(url=original_url)
+            return responses.RedirectResponse(
+                url=original_url,
+                headers={"Cache-Control": f"public, max-age={REDIRECT_CACHE_MAX_AGE_SECONDS}"},
+            )
         raise HTTPException(status_code=404, detail='Short code not found')
 
     def lookup(self, code: str) -> str:
