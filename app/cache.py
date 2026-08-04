@@ -121,6 +121,31 @@ def record_hit(code: str) -> None:
         logger.exception('Redis unavailable on record_hit() -- click not recorded')
 
 
+def update_fields(code: str, **fields) -> None:
+    """Write-through: patch specific fields of an existing cache entry in
+    place, without evicting it or touching click_count/last_accessed_at
+    (the pending click delta) at all -- a partial HSET simply never
+    touches fields it isn't given, so nothing pending can be lost.
+
+    A field passed as None means "clear it" (HDEL, e.g. removing a
+    password or reactivating an expired link); a field simply not passed
+    is left untouched. No-op if the code isn't currently cached -- there's
+    nothing to write through to, and the next real read will populate a
+    fresh, already-correct entry from the database."""
+    key = _key(code)
+    try:
+        if not _redis.exists(key):
+            return
+        to_set = _to_redis_hash(fields)
+        to_clear = [name for name, value in fields.items() if value is None]
+        if to_set:
+            _redis.hset(key, mapping=to_set)
+        if to_clear:
+            _redis.hdel(key, *to_clear)
+    except redis.RedisError:
+        logger.exception('Redis unavailable on update_fields()')
+
+
 def invalidate(code: str) -> None:
     """Evict a code's cache entry, flushing its pending click delta first
     so a delete/edit doesn't silently discard unflushed clicks. Must be

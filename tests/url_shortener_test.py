@@ -1093,22 +1093,79 @@ def test_delete_invalidates_cache():
     assert response.status_code == 404
 
 
-def test_edit_invalidates_cache():
-    """Editing a link's destination must be reflected immediately, even
-    if the old destination was already cached."""
+def test_edit_updates_cache_in_place():
+    """
+    Editing a link's destination must be reflected immediately, even if
+    the old destination was already cached. This is now write-through
+    (the cache entry is patched, not evicted) rather than invalidation --
+    verify the entry stays present in the cache the whole time.
+    """
     user = _get_test_user("cache-edit-owner@test.com")
     original_url = f"https://example.com/{uuid.uuid4()}"
     code = _shorten(original_url, user.api_key)
 
     client.get(f"/redirect?code={code}", follow_redirects=False)  # populate cache
+    assert cache.get(code) is not None
 
     new_url = f"https://example.com/new-{uuid.uuid4()}"
     edit = client.put(f"/urls/{code}", json={"url": new_url}, headers={"X-API-Key": user.api_key})
     assert edit.status_code == 200
 
+    # write-through, not invalidation: the entry is still cached, already
+    # holding the new value -- no eviction, no forced re-fetch from the DB
+    cached = cache.get(code)
+    assert cached is not None
+    assert cached.original_url.rstrip("/") == new_url
+
     response = client.get(f"/redirect?code={code}", follow_redirects=False)
     assert response.status_code == 307
     assert response.headers["location"].rstrip("/") == new_url
+
+
+def test_edit_preserves_pending_clicks_via_write_through():
+    """
+    Write-through must not reset click_count -- a partial HSET never
+    touches fields it isn't given, so pending (unflushed) clicks
+    accumulated before an edit must survive it.
+    """
+    user = _get_test_user("cache-edit-clicks@test.com")
+    code = _shorten(f"https://example.com/{uuid.uuid4()}", user.api_key)
+
+    for _ in range(4):
+        client.get(f"/redirect?code={code}", follow_redirects=False)
+    pending_before = cache.get(code).click_count
+    assert pending_before == 3  # 1st hit is a DB-writing miss, next 3 are pending cache hits
+
+    edit = client.put(
+        f"/urls/{code}", json={"expires_at": None}, headers={"X-API-Key": user.api_key}
+    )
+    assert edit.status_code == 200
+    assert cache.get(code).click_count == pending_before
+
+
+def test_edit_clears_password_in_cache():
+    """
+    Explicitly clearing a field (password: null) must remove it from the
+    cache entry too, not just the database -- otherwise a stale
+    password_hash left behind in Redis would keep enforcing a paywall
+    that no longer exists in the DB.
+    """
+    user = _get_test_user("cache-edit-clear-password@test.com")
+    response = client.post(
+        "/shorten",
+        json={"url": "https://example.com", "password": "secret1"},
+        headers={"X-API-Key": user.api_key},
+    )
+    code = response.json()["short_url"]
+    client.get(f"/redirect?code={code}&password=secret1", follow_redirects=False)  # populate cache
+    assert cache.get(code).password_hash is not None
+
+    edit = client.put(f"/urls/{code}", json={"password": None}, headers={"X-API-Key": user.api_key})
+    assert edit.status_code == 200
+    assert cache.get(code).password_hash is None
+
+    response = client.get(f"/redirect?code={code}", follow_redirects=False)
+    assert response.status_code == 307
 
 
 def test_rejected_delete_does_not_invalidate_cache():

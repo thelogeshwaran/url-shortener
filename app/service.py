@@ -110,7 +110,6 @@ class UrlService:
             raise HTTPException(status_code=403, detail='You are not authorized to edit this URL')
 
         changes = request.model_dump(exclude_unset=True)
-        cache.invalidate(code)
         if 'url' in changes:
             changes['original_url'] = str(changes.pop('url'))
         if 'password' in changes:
@@ -120,6 +119,7 @@ class UrlService:
         edited = self.repository.update_url(code, changes)
         if not edited:
             raise HTTPException(status_code=404, detail='Short code not found')
+        cache.update_fields(code, **changes)  # write-through: patch in place, don't evict
         return edited
     
     def get_all_urls_by_user(self, user_id: int, page: int, size: int) -> PaginatedUrlsResponse:
