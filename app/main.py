@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from app import cache
 from app.middleware.logging import log_requests
 from app.middleware.blacklist import blacklist
+from app.middleware.rate_limit import rate_limit, rate_limit_api
 from app.middleware.auth import check_api_key
 from app.middleware.authorization import authorization
 from app.middleware.timing import timing
@@ -27,6 +28,10 @@ app.middleware("http")(timed(authorization))
 app.middleware("http")(timed(check_api_key))
 
 app.middleware("http")(timed(blacklist))
+
+app.middleware("http")(timed(rate_limit))
+
+app.middleware("http")(timed(rate_limit_api))
 
 app.middleware("http")(timed(log_requests))
 

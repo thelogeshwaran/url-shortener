@@ -5,15 +5,30 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
 from app import cache
 from app.database import get_session
 from app.main import app
+from app.middleware.rate_limit import _redis as _rate_limit_redis
 from app.models import Url, User
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limit():
+    """
+    TestClient always reports the same fake peer IP ("testclient") for
+    every request across the whole suite -- without resetting this
+    between tests, the shared counter would accumulate across all ~95
+    other tests in this file and start returning 429s for unrelated
+    tests long before any rate-limit test itself ever runs.
+    """
+    _rate_limit_redis.delete('ratelimit:testclient')
+    yield
 
 
 def _get_url_row(code: str) -> Url | None:
@@ -1207,3 +1222,114 @@ def test_cached_password_protected_link_still_enforces_password():
     # second call: should be served from cache, but wrong password must still 401
     wrong = client.get(f"/redirect?code={code}&password=wrongpass", follow_redirects=False)
     assert wrong.status_code == 401
+
+
+def test_rate_limit_allows_requests_under_the_limit():
+    for _ in range(5):
+        response = client.get("/redirect?code=nonexistent-rl-test", follow_redirects=False)
+        assert response.status_code != 429
+
+
+def test_rate_limit_blocks_after_exceeding_limit():
+    from app.middleware.rate_limit import RATE_LIMIT_MAX_REQUESTS
+
+    last_response = None
+    for _ in range(RATE_LIMIT_MAX_REQUESTS + 1):
+        last_response = client.get("/redirect?code=nonexistent-rl-test", follow_redirects=False)
+
+    assert last_response.status_code == 429
+    assert last_response.json()["detail"] == "Too many requests"
+
+
+def test_rate_limit_response_includes_retry_after_header():
+    from app.middleware.rate_limit import RATE_LIMIT_MAX_REQUESTS
+
+    last_response = None
+    for _ in range(RATE_LIMIT_MAX_REQUESTS + 1):
+        last_response = client.get("/redirect?code=nonexistent-rl-test", follow_redirects=False)
+
+    assert last_response.status_code == 429
+    retry_after = int(last_response.headers["retry-after"])
+    assert 0 < retry_after <= 60
+
+
+def test_health_check_exempt_from_rate_limit():
+    for _ in range(150):
+        response = client.get("/health")
+        assert response.status_code != 429
+
+
+def test_rate_limit_api_uses_correct_header():
+    """The API-key rate limiter must key on the real X-API-Key header --
+    not treat every caller (keyed or not) as the same shared identity."""
+    from app.middleware.rate_limit import _redis
+
+    key = f"test-rl-{uuid.uuid4().hex}"
+    _redis.delete(f"ratelimit:{key}:/shorten")
+    _redis.delete("ratelimit:None:/shorten")
+
+    client.post("/shorten", json={"url": "https://example.com"}, headers={"X-API-Key": key})
+
+    assert _redis.exists(f"ratelimit:{key}:/shorten"), "no bucket created under the real key"
+    assert _redis.get(f"ratelimit:{key}:/shorten") == "1"
+
+
+def test_rate_limit_api_skips_requests_without_a_key():
+    """Anonymous requests are Q8's (IP-based) responsibility -- this
+    limiter must not create a shared 'None' bucket for them at all."""
+    from app.middleware.rate_limit import _redis
+
+    _redis.delete("ratelimit:None:/shorten")
+    client.post("/shorten", json={"url": "https://example.com"})
+    assert not _redis.exists("ratelimit:None:/shorten")
+
+
+def test_shorten_api_limit_is_20_per_second():
+    key = f"test-rl-{uuid.uuid4().hex}"
+    last_response = None
+    for _ in range(21):
+        last_response = client.post(
+            "/shorten", json={"url": "https://example.com"}, headers={"X-API-Key": key}
+        )
+    assert last_response.status_code == 429
+    assert last_response.json()["detail"] == "Too many requests"
+
+
+def test_redirect_api_limit_is_50_per_second():
+    """
+    Must allow up to 50 -- not just 'eventually 429s by request 51',
+    which would also be true (falsely) if the threshold were wrongly
+    set to 10, the same value /shorten uses.
+    """
+    key = f"test-rl-{uuid.uuid4().hex}"
+    responses = [
+        client.get(
+            "/redirect?code=nonexistent-rl-test",
+            headers={"X-API-Key": key},
+            follow_redirects=False,
+        )
+        for _ in range(50)
+    ]
+    assert all(r.status_code != 429 for r in responses), "limit tripped before reaching 50"
+
+    response_51 = client.get(
+        "/redirect?code=nonexistent-rl-test",
+        headers={"X-API-Key": key},
+        follow_redirects=False,
+    )
+    assert response_51.status_code == 429
+
+
+def test_shorten_and_redirect_api_limits_are_independent():
+    """Exhausting the /shorten budget for a key must not affect that
+    same key's separate /redirect budget."""
+    key = f"test-rl-{uuid.uuid4().hex}"
+    for _ in range(10):
+        client.post("/shorten", json={"url": "https://example.com"}, headers={"X-API-Key": key})
+
+    response = client.get(
+        "/redirect?code=nonexistent-rl-test",
+        headers={"X-API-Key": key},
+        follow_redirects=False,
+    )
+    assert response.status_code != 429
