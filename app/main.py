@@ -12,6 +12,7 @@ from app.middleware.authorization import authorization
 from app.middleware.timing import timing
 from app.routers import router
 from app.middleware.timed import timed
+from app.middleware.rate_limit_tier import rate_limit_tier
 
 
 @asynccontextmanager
@@ -24,6 +25,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 app.middleware("http")(timed(authorization))
+
+app.middleware("http")(timed(rate_limit_tier))
 
 app.middleware("http")(timed(check_api_key))
 

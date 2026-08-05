@@ -1333,3 +1333,92 @@ def test_shorten_and_redirect_api_limits_are_independent():
         follow_redirects=False,
     )
     assert response.status_code != 429
+
+
+def test_rate_limit_tier_skips_non_free_users():
+    """Hobby-tier users are already blocked from /shorten/batch by the
+    enterprise gate (authorization.py) on every request -- the free-tier
+    rate limiter must not additionally trip a 429 for them, since it isn't
+    their limit to enforce."""
+    user = _get_test_user("hobby@test.com", tier="hobby")
+    for _ in range(7):
+        response = client.post(
+            "/shorten/batch",
+            json={"urls": [{"url": "https://example.com"}]},
+            headers={"X-API-Key": user.api_key},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "Bulk creation requires the enterprise tier"
+
+
+def test_free_tier_batch_requests_blocked_after_5_within_window():
+    """Pins the actual current behavior: /shorten/batch already returns 403
+    for every non-enterprise tier via authorization.py, which runs *after*
+    rate_limit_tier -- so the first 5 free-tier requests still surface as
+    403 (the enterprise gate), and only request 6+ within the 60s window is
+    intercepted earlier as 429 by the tier limiter itself."""
+    from app.middleware.rate_limit_tier import _redis as _tier_redis
+
+    user = _get_test_user(f"free-{uuid.uuid4().hex}@test.com", tier="free")
+    _tier_redis.delete(f"{user.id}:/shorten/batch")
+
+    responses = [
+        client.post(
+            "/shorten/batch",
+            json={"urls": [{"url": "https://example.com"}]},
+            headers={"X-API-Key": user.api_key},
+        )
+        for _ in range(5)
+    ]
+    assert all(r.status_code == 403 for r in responses)
+
+    sixth = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": "https://example.com"}]},
+        headers={"X-API-Key": user.api_key},
+    )
+    assert sixth.status_code == 429
+    assert sixth.json()["detail"] == "Too many requests"
+
+
+def test_rate_limit_tier_is_scoped_per_user():
+    """Two different free-tier users must not share the same budget."""
+    from app.middleware.rate_limit_tier import _redis as _tier_redis
+
+    user_a = _get_test_user(f"free-a-{uuid.uuid4().hex}@test.com", tier="free")
+    user_b = _get_test_user(f"free-b-{uuid.uuid4().hex}@test.com", tier="free")
+    _tier_redis.delete(f"{user_a.id}:/shorten/batch")
+    _tier_redis.delete(f"{user_b.id}:/shorten/batch")
+
+    for _ in range(6):
+        client.post(
+            "/shorten/batch",
+            json={"urls": [{"url": "https://example.com"}]},
+            headers={"X-API-Key": user_a.api_key},
+        )
+
+    # user_a is now over budget; user_b's separate bucket must be untouched
+    response = client.post(
+        "/shorten/batch",
+        json={"urls": [{"url": "https://example.com"}]},
+        headers={"X-API-Key": user_b.api_key},
+    )
+    assert response.status_code == 403  # the enterprise gate, not 429
+
+
+def test_free_tier_shorten_endpoint_is_not_yet_rate_limited_by_tier_rule():
+    """`included_path` in rate_limit_tier.py currently only covers
+    /shorten/batch -- which free-tier users are already unconditionally
+    blocked from by the enterprise gate, so this rule can never actually
+    fire for them there. /shorten and /redirect, the endpoints free users
+    can actually call, aren't covered at all yet. This test pins that gap;
+    it should start failing (in a good way, prompting an update) once
+    /shorten and /redirect are added to included_path."""
+    user = _get_test_user(f"free-shorten-{uuid.uuid4().hex}@test.com", tier="free")
+    for _ in range(6):
+        response = client.post(
+            "/shorten",
+            json={"url": "https://example.com"},
+            headers={"X-API-Key": user.api_key},
+        )
+        assert response.status_code != 429
