@@ -13,6 +13,7 @@ deployment behind one would need to read X-Forwarded-For instead (with
 the caveat that it's spoofable unless the trusted proxy overwrites it).
 """
 import os
+import time
 
 import redis
 from fastapi.responses import JSONResponse
@@ -43,25 +44,36 @@ async def rate_limit(request, call_next):
     ip = request.client.host if request.client else 'unknown'
     key = f'ratelimit:{ip}'
 
+    headers = None
     try:
         count = _redis.incr(key)
         if count == 1:
             _redis.expire(key, RATE_LIMIT_WINDOW_SECONDS)  # only on the window's first request
 
+        ttl = _redis.ttl(key)
+        window_remaining = ttl if ttl and ttl > 0 else RATE_LIMIT_WINDOW_SECONDS
+        headers = {
+            'X-RateLimit-Limit': str(RATE_LIMIT_MAX_REQUESTS),
+            'X-RateLimit-Remaining': str(max(0, RATE_LIMIT_MAX_REQUESTS - count)),
+            'X-RateLimit-Reset': str(int(time.time()) + window_remaining),
+        }
+
         if count > RATE_LIMIT_MAX_REQUESTS:
-            ttl = _redis.ttl(key)
-            retry_after = ttl if ttl and ttl > 0 else RATE_LIMIT_WINDOW_SECONDS
             return JSONResponse(
                 status_code=429,
                 content={'detail': 'Too many requests'},
-                headers={'Retry-After': str(retry_after)},
+                headers={**headers, 'Retry-After': str(window_remaining)},
             )
     except redis.RedisError:
         # fail open: a Redis outage must not block all traffic, same
-        # philosophy as blacklist.py and cache.py
+        # philosophy as blacklist.py and cache.py -- no rate-limit headers
+        # either, since we have no reliable count/TTL to report
         pass
 
-    return await call_next(request)
+    response = await call_next(request)
+    if headers:
+        response.headers.update(headers)
+    return response
 
 
 async def rate_limit_api(request, call_next):
