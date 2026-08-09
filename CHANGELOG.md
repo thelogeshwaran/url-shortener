@@ -13,6 +13,22 @@ project's build history rather than tracked release-by-release.
 
 ---
 
+## [5.0.0] - **major** ⚠️
+### Changed — breaking
+- `GET /urls` response body is now a pagination envelope
+  `{urls, total, page, size}` instead of a bare `[...]` array of links.
+  `page`/`size` query params (default `1`/`10`) control the slice returned.
+
+Hypothetical exercise entry: `GET /urls` already shipped paginated from day
+one (see `4.3.0`, M2A2 Q15), so no prior bare-array version of this endpoint
+ever actually existed for a real client to depend on — nothing broke in
+practice. This entry documents what the version bump *would* have to be if
+pagination were instead retrofitted onto an already-shipped, previously
+unpaginated `GET /urls`: any caller iterating the old bare array or indexing
+into it directly breaks against the new object shape. That's a response-shape
+break, not just additive new query params, so it's major, not minor, despite
+being "new functionality."
+
 ## [4.5.1] - patch
 
 ### Fixed / Internal
