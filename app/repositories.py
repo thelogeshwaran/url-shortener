@@ -1,11 +1,14 @@
 from datetime import datetime, timezone
+from sqlalchemy.exc import OperationalError
 from sqlmodel import or_, select, update
 
 from app.database import get_session
 from app.models import Url, User
+from app.retry import retry_with_backoff
 
 
-class UrlRepository: 
+class UrlRepository:
+    @retry_with_backoff(OperationalError, max_retries=3, base_delay=0.5, max_delay=8.0)
     def save_url(
         self,
         code: str,
