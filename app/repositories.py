@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from sqlalchemy.exc import OperationalError
 from sqlmodel import or_, select, update
 
+from app.circuit_breaker import circuit_breaker
 from app.database import get_session
 from app.models import Url, User
 from app.retry import retry_with_backoff
@@ -9,6 +10,7 @@ from app.retry import retry_with_backoff
 
 class UrlRepository:
     @retry_with_backoff(OperationalError, max_retries=3, base_delay=0.5, max_delay=8.0)
+    @circuit_breaker(OperationalError, failure_threshold=3, reset_timeout=10)
     def save_url(
         self,
         code: str,
