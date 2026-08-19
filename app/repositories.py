@@ -110,9 +110,29 @@ class UrlRepository:
             return len(urls)
 
 
-class UserRepository: 
-    def get_user_by_api_key(self, api_key: str) -> User | None: 
-        with get_session() as session: 
+class UserRepository:
+    def get_user_by_api_key(self, api_key: str) -> User | None:
+        with get_session() as session:
             stmt = select(User).where(User.api_key == api_key)
             user = session.exec(stmt).first()
             return user
+
+    def get_users_pending_thumbnail(self) -> list[User]:
+        """Users who've uploaded an image but don't have a thumbnail yet --
+        the exact set the thumbnail-generation cron job needs to process."""
+        with get_session() as session:
+            stmt = select(User).where(
+                User.image_path.is_not(None),
+                User.thumbnail_path.is_(None),
+            )
+            return session.exec(stmt).all()
+
+    def set_thumbnail_path(self, user_id: int, thumbnail_path: str) -> None:
+        with get_session() as session:
+            stmt = (
+                update(User)
+                .where(User.id == user_id)
+                .values(thumbnail_path=thumbnail_path)
+            )
+            session.exec(stmt)
+            session.commit()

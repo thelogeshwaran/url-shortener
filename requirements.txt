@@ -19,6 +19,7 @@ idna==3.18
 iniconfig==2.3.0
 newrelic==13.2.0
 packaging==26.2
+pillow==12.3.0
 pluggy==1.6.0
 psycopg2-binary==2.9.12
 pydantic==2.13.4

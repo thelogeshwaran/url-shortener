@@ -26,3 +26,5 @@ class User(SQLModel, table=True):
     api_key: str = Field(unique=True, index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     tier: str = Field(default="hobby")
+    image_path: str | None = Field(default=None)
+    thumbnail_path: str | None = Field(default=None)

@@ -1,0 +1,9 @@
+2026-08-20 00:40:04,026 | found 5 user(s) needing a thumbnail
+2026-08-20 00:40:04,074 | user 1: thumbnail saved to /Users/logesh/Documents/Vyson/M2/url-shortener/uploads/thumbnails/1.jpg
+2026-08-20 00:40:04,092 | user 2: thumbnail saved to /Users/logesh/Documents/Vyson/M2/url-shortener/uploads/thumbnails/2.jpg
+2026-08-20 00:40:04,109 | user 3: thumbnail saved to /Users/logesh/Documents/Vyson/M2/url-shortener/uploads/thumbnails/3.jpg
+2026-08-20 00:40:04,125 | user 4: thumbnail saved to /Users/logesh/Documents/Vyson/M2/url-shortener/uploads/thumbnails/4.jpg
+2026-08-20 00:40:04,142 | user 5: thumbnail saved to /Users/logesh/Documents/Vyson/M2/url-shortener/uploads/thumbnails/5.jpg
+2026-08-20 00:40:04,142 | done: 5 succeeded, 0 failed
+2026-08-20 00:41:01,051 | found 0 user(s) needing a thumbnail
+2026-08-20 00:41:01,051 | done: 0 succeeded, 0 failed
