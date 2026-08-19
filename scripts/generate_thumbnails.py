@@ -13,27 +13,13 @@ import logging
 import sys
 from pathlib import Path
 
-from PIL import Image
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.repositories import UserRepository  # noqa: E402
-
-THUMBNAIL_SIZE = (300, 300)
-THUMBNAIL_DIR = Path(__file__).resolve().parents[1] / 'uploads' / 'thumbnails'
+from app.thumbnails import generate_thumbnail_for_user  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 logger = logging.getLogger('generate_thumbnails')
-
-
-def generate_thumbnail(image_path: str, user_id: int) -> str:
-    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
-    with Image.open(image_path) as image:
-        image = image.convert('RGB')
-        image = image.resize(THUMBNAIL_SIZE)
-        thumbnail_path = THUMBNAIL_DIR / f'{user_id}.jpg'
-        image.save(thumbnail_path, format='JPEG')
-    return str(thumbnail_path)
 
 
 def run() -> None:
@@ -44,8 +30,7 @@ def run() -> None:
     succeeded, failed = 0, 0
     for user in users:
         try:
-            thumbnail_path = generate_thumbnail(user.image_path, user.id)
-            repository.set_thumbnail_path(user.id, thumbnail_path)
+            thumbnail_path = generate_thumbnail_for_user(user.id)
             logger.info('user %d: thumbnail saved to %s', user.id, thumbnail_path)
             succeeded += 1
         except Exception:

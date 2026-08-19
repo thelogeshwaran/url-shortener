@@ -117,6 +117,11 @@ class UserRepository:
             user = session.exec(stmt).first()
             return user
 
+    def get_user_by_id(self, user_id: int) -> User | None:
+        with get_session() as session:
+            stmt = select(User).where(User.id == user_id)
+            return session.exec(stmt).first()
+
     def get_users_pending_thumbnail(self) -> list[User]:
         """Users who've uploaded an image but don't have a thumbnail yet --
         the exact set the thumbnail-generation cron job needs to process."""
@@ -126,6 +131,19 @@ class UserRepository:
                 User.thumbnail_path.is_(None),
             )
             return session.exec(stmt).all()
+
+    def set_image_path(self, user_id: int, image_path: str) -> None:
+        """A fresh upload replaces any previous thumbnail too -- the old
+        one was generated from the old image, so it's stale until the
+        background job regenerates it for the new one."""
+        with get_session() as session:
+            stmt = (
+                update(User)
+                .where(User.id == user_id)
+                .values(image_path=image_path, thumbnail_path=None)
+            )
+            session.exec(stmt)
+            session.commit()
 
     def set_thumbnail_path(self, user_id: int, thumbnail_path: str) -> None:
         with get_session() as session:

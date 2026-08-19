@@ -1,19 +1,24 @@
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app import task_queue
 from app.database import get_session
 from app.repositories import UrlRepository, UserRepository
 from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest, PaginatedUrlsResponse, LookupResponse
 from app.service import UrlService, UserService
+from app.thumbnails import generate_thumbnail_for_user
 from app.models import User
 
 router = APIRouter()
+
+UPLOAD_DIR = Path(__file__).resolve().parents[1] / 'uploads' / 'originals'
 
 async_demo_logger = logging.getLogger('async_demo')
 async_demo_logger.setLevel(logging.INFO)
@@ -21,6 +26,13 @@ if not async_demo_logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
     async_demo_logger.addHandler(_handler)
+
+upload_logger = logging.getLogger('upload')
+upload_logger.setLevel(logging.INFO)
+if not upload_logger.handlers:
+    _upload_handler = logging.StreamHandler()
+    _upload_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+    upload_logger.addHandler(_upload_handler)
 
 
 def _slow_task(label: str):
@@ -130,6 +142,51 @@ def async_task():
     threading.Thread(target=_slow_task, args=('/async',), daemon=True).start()
     async_demo_logger.info('/async returning response')
     return {'message': 'Accepted'}
+
+
+@router.post('/users/me/image', status_code=202)
+def upload_profile_image(
+    user: Annotated[User | None, Depends(get_current_user)],
+    file: UploadFile,
+):
+    """File upload and thumbnail generation are decoupled: this saves
+    the upload and enqueues the thumbnail job, then returns immediately
+    -- it does not wait for the thumbnail to actually be generated.
+    The log timestamps show the response going out well before the
+    background worker finishes the resize."""
+    if not user:
+        raise HTTPException(status_code=401, detail='Unauthorized')
+
+    upload_logger.info('user %d: upload received (%s)', user.id, file.filename)
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    extension = Path(file.filename or '').suffix or '.png'
+    image_path = UPLOAD_DIR / f'{user.id}{extension}'
+    with open(image_path, 'wb') as f:
+        f.write(file.file.read())
+    upload_logger.info('user %d: image saved to %s', user.id, image_path)
+
+    UserRepository().set_image_path(user.id, str(image_path))
+    task_queue.enqueue(generate_thumbnail_for_user, user.id)
+    upload_logger.info('user %d: thumbnail task enqueued, returning response', user.id)
+
+    return {'status': 'uploaded', 'image_path': str(image_path)}
+
+
+@router.post('/enqueue', status_code=202)
+def enqueue_thumbnail_task(user: Annotated[User | None, Depends(get_current_user)]):
+    """Queue-based version of the same background-work idea as /async,
+    but durable-within-process across many callers instead of one
+    thread per request: this drops a task onto the shared queue and a
+    single background worker (started in main.py's lifespan) works
+    through it. Deliberately only ever enqueues a thumbnail job for the
+    caller's own account -- not a generic "run any function" endpoint,
+    since accepting an arbitrary task/target from the request body
+    would be a remote-code-execution hole, not a queue demo."""
+    if not user:
+        raise HTTPException(status_code=401, detail='Unauthorized')
+    task_queue.enqueue(generate_thumbnail_for_user, user.id)
+    return {'status': 'queued', 'user_id': user.id}
 
 
 @router.get('/health')
