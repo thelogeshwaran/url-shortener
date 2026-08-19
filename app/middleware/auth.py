@@ -9,7 +9,9 @@ exclued_path = [
     "/health",
     "/shorten",
     "/redirect",
-    "/lookup"
+    "/lookup",
+    "/sync",
+    "/async",
 ]
 
 

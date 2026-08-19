@@ -1,3 +1,6 @@
+import logging
+import threading
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -11,6 +14,18 @@ from app.service import UrlService, UserService
 from app.models import User
 
 router = APIRouter()
+
+async_demo_logger = logging.getLogger('async_demo')
+async_demo_logger.setLevel(logging.INFO)
+if not async_demo_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+    async_demo_logger.addHandler(_handler)
+
+
+def _slow_task(label: str):
+    time.sleep(3)
+    async_demo_logger.info('%s task finished', label)
 
 
 def get_service() -> UrlService:
@@ -94,6 +109,27 @@ def get_all_urls_by_user(
     if not user:
         raise HTTPException(status_code=401, detail='Unauthorized')
     return service.get_all_urls_by_user(user.id, page, size)
+
+
+@router.get('/sync')
+def sync_task():
+    """Blocking: the slow work happens before we respond, so the caller
+    waits the full 3 seconds for the response itself."""
+    async_demo_logger.info('/sync request received, starting slow task')
+    _slow_task('/sync')
+    async_demo_logger.info('/sync returning response')
+    return {'message': 'Done'}
+
+
+@router.get('/async')
+def async_task():
+    """Non-blocking: the slow work is handed to a background thread and
+    we respond immediately -- the task finishes well after the response
+    has already gone out, which the log timestamps make visible."""
+    async_demo_logger.info('/async request received, spawning background task')
+    threading.Thread(target=_slow_task, args=('/async',), daemon=True).start()
+    async_demo_logger.info('/async returning response')
+    return {'message': 'Accepted'}
 
 
 @router.get('/health')
