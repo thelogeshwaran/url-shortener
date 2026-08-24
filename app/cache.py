@@ -1,7 +1,19 @@
 """Redis-backed cache for short_code -> redirect target, with write-behind
 click tracking: a cache hit increments a counter atomically in Redis
-instead of writing to the database immediately; a periodic background
-task flushes accumulated deltas to the database on an interval.
+instead of writing to the database immediately; accumulated deltas are
+flushed to the database via two independent triggers, whichever fires
+first:
+- a periodic background task, every FLUSH_INTERVAL_SECONDS (time-based)
+- a running count of hits since the last flush, the moment it crosses
+  PENDING_FLUSH_THRESHOLD (count-based)
+
+The count-based trigger exists for the opposite failure mode the pure
+timer has: under a traffic spike, waiting the full interval could let an
+unbounded number of hits pile up between flushes. Crossing the threshold
+enqueues a flush onto the same background task queue used elsewhere in
+this app (app/task_queue.py) rather than running it inline -- record_hit()
+stays a fast, DB-free Redis write either way; the actual flush (and its
+DB round trip) always happens off the request path.
 
 Unlike the in-memory dict this replaces, the cache now survives a server
 restart (Redis is a separate, persistent process), and click increments
@@ -24,15 +36,18 @@ from datetime import datetime
 
 import redis
 
+from app import task_queue
 from app.repositories import UrlRepository
 
 logger = logging.getLogger('cache')
 
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
 FLUSH_INTERVAL_SECONDS = 30
+PENDING_FLUSH_THRESHOLD = 100
 
 _redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 _flush_task: asyncio.Task | None = None
+_PENDING_HITS_KEY = 'cache:pending_hit_count'
 
 
 @dataclass
@@ -117,6 +132,16 @@ def record_hit(code: str) -> None:
             return
         _redis.hincrby(key, 'click_count', 1)
         _redis.hset(key, 'last_accessed_at', datetime.utcnow().isoformat())
+
+        pending = _redis.incr(_PENDING_HITS_KEY)
+        if pending >= PENDING_FLUSH_THRESHOLD:
+            # Subtract exactly the threshold, not reset-to-zero -- a hit
+            # recorded concurrently, between this check and the flush
+            # actually running, must still count toward the *next*
+            # threshold instead of being silently dropped (same
+            # accounting the per-code counters below already use).
+            _redis.decrby(_PENDING_HITS_KEY, PENDING_FLUSH_THRESHOLD)
+            task_queue.enqueue(flush_pending_clicks)
     except redis.RedisError:
         logger.exception('Redis unavailable on record_hit() -- click not recorded')
 
