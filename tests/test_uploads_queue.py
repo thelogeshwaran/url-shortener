@@ -32,8 +32,11 @@ def test_upload_image_returns_immediately_and_thumbnail_follows_in_background():
     assert body["image_path"].endswith(f"{user.id}.png")
 
     # The upload response doesn't wait on thumbnail generation -- but the
-    # background worker should complete it shortly after.
-    assert _wait_until(lambda: _get_user_row(user.id).thumbnail_path is not None), \
+    # background worker should complete it shortly after. Timeout is
+    # generous because each image_uploaded event also runs log_upload
+    # (1s) and notify_admin (2s) in the same worker before it's free to
+    # pick up the next queued event.
+    assert _wait_until(lambda: _get_user_row(user.id).thumbnail_path is not None, timeout=10), \
         "thumbnail was never generated in the background"
 
     row = _get_user_row(user.id)
@@ -87,19 +90,20 @@ def test_enqueue_generates_thumbnail_for_an_already_uploaded_image():
     assert response.status_code == 202
     assert response.json() == {"status": "queued", "user_id": user.id}
 
-    assert _wait_until(lambda: _get_user_row(user.id).thumbnail_path is not None), \
+    assert _wait_until(lambda: _get_user_row(user.id).thumbnail_path is not None, timeout=10), \
         "thumbnail was never generated in the background"
 
     image_path.unlink(missing_ok=True)
 
 
 def test_task_queue_worker_survives_a_failing_task():
-    """A single background worker thread processes every queued task --
-    if an uncaught exception ever killed that thread, every task queued
-    after the failing one would silently never run again. This proves
-    the worker isolates failures per-task instead."""
-    from app.task_queue import enqueue
-    from app.thumbnails import generate_thumbnail_for_user
+    """Two background worker threads process every queued image_uploaded
+    event -- if an uncaught exception in one of the three handlers
+    (generate_thumbnail_for_user, log_upload, notify_admin) ever killed
+    a worker thread, every event that worker picks up afterward would
+    silently never run. This proves each handler's failure is isolated
+    instead."""
+    from app.task_queue import publish
 
     broken_user = _get_test_user(f"broken-{uuid.uuid4().hex}@test.com")
     with get_session() as session:
@@ -107,7 +111,7 @@ def test_task_queue_worker_survives_a_failing_task():
         db_user.image_path = None  # generate_thumbnail_for_user will raise for this user
         session.add(db_user)
         session.commit()
-    enqueue(generate_thumbnail_for_user, broken_user.id)
+    publish('image_uploaded', broken_user.id)
 
     good_user = _get_test_user(f"recovers-{uuid.uuid4().hex}@test.com")
     image_path = Path(f"/tmp/worker-recovery-test-{uuid.uuid4().hex}.png")
@@ -118,9 +122,9 @@ def test_task_queue_worker_survives_a_failing_task():
         db_user.thumbnail_path = None
         session.add(db_user)
         session.commit()
-    enqueue(generate_thumbnail_for_user, good_user.id)
+    publish('image_uploaded', good_user.id)
 
-    assert _wait_until(lambda: _get_user_row(good_user.id).thumbnail_path is not None), \
-        "worker thread appears to have died after the earlier task's failure"
+    assert _wait_until(lambda: _get_user_row(good_user.id).thumbnail_path is not None, timeout=10), \
+        "a worker thread appears to have died after the earlier event's failure"
 
     image_path.unlink(missing_ok=True)

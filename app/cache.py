@@ -10,10 +10,12 @@ first:
 The count-based trigger exists for the opposite failure mode the pure
 timer has: under a traffic spike, waiting the full interval could let an
 unbounded number of hits pile up between flushes. Crossing the threshold
-enqueues a flush onto the same background task queue used elsewhere in
-this app (app/task_queue.py) rather than running it inline -- record_hit()
-stays a fast, DB-free Redis write either way; the actual flush (and its
-DB round trip) always happens off the request path.
+runs a flush on its own one-off background thread rather than inline --
+record_hit() stays a fast, DB-free Redis write either way; the actual
+flush (and its DB round trip) always happens off the request path.
+(Not routed through app/task_queue.py's queue -- that queue is
+specifically the "image_uploaded" event pipeline now, not a generic
+task runner, and a click flush isn't part of that story.)
 
 Unlike the in-memory dict this replaces, the cache now survives a server
 restart (Redis is a separate, persistent process), and click increments
@@ -31,12 +33,12 @@ Trade-offs still accepted for this exercise:
 import asyncio
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 
 import redis
 
-from app import task_queue
 from app.repositories import UrlRepository
 
 logger = logging.getLogger('cache')
@@ -141,7 +143,7 @@ def record_hit(code: str) -> None:
             # threshold instead of being silently dropped (same
             # accounting the per-code counters below already use).
             _redis.decrby(_PENDING_HITS_KEY, PENDING_FLUSH_THRESHOLD)
-            task_queue.enqueue(flush_pending_clicks)
+            threading.Thread(target=flush_pending_clicks, daemon=True).start()
     except redis.RedisError:
         logger.exception('Redis unavailable on record_hit() -- click not recorded')
 

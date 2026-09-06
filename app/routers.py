@@ -13,7 +13,6 @@ from app.database import get_session
 from app.repositories import UrlRepository, UserRepository
 from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest, PaginatedUrlsResponse, LookupResponse
 from app.service import UrlService, UserService
-from app.thumbnails import generate_thumbnail_for_user
 from app.models import User
 
 router = APIRouter()
@@ -149,11 +148,12 @@ def upload_profile_image(
     user: Annotated[User | None, Depends(get_current_user)],
     file: UploadFile,
 ):
-    """File upload and thumbnail generation are decoupled: this saves
-    the upload and enqueues the thumbnail job, then returns immediately
-    -- it does not wait for the thumbnail to actually be generated.
-    The log timestamps show the response going out well before the
-    background worker finishes the resize."""
+    """File upload and its follow-up work are decoupled: this saves the
+    upload and enqueues an 'image_uploaded' event, then returns
+    immediately -- it does not wait for the thumbnail, analytics log, or
+    Slack notification the workers run in response. The log timestamps
+    show the response going out well before the background workers
+    finish."""
     if not user:
         raise HTTPException(status_code=401, detail='Unauthorized')
 
@@ -167,8 +167,8 @@ def upload_profile_image(
     upload_logger.info('user %d: image saved to %s', user.id, image_path)
 
     UserRepository().set_image_path(user.id, str(image_path))
-    task_queue.enqueue(generate_thumbnail_for_user, user.id)
-    upload_logger.info('user %d: thumbnail task enqueued, returning response', user.id)
+    task_queue.publish('image_uploaded', user.id)
+    upload_logger.info('user %d: image_uploaded event published, returning response', user.id)
 
     return {'status': 'uploaded', 'image_path': str(image_path)}
 
@@ -177,15 +177,15 @@ def upload_profile_image(
 def enqueue_thumbnail_task(user: Annotated[User | None, Depends(get_current_user)]):
     """Queue-based version of the same background-work idea as /async,
     but durable-within-process across many callers instead of one
-    thread per request: this drops a task onto the shared queue and a
-    single background worker (started in main.py's lifespan) works
-    through it. Deliberately only ever enqueues a thumbnail job for the
+    thread per request: this publishes an 'image_uploaded' event onto
+    the shared queue and the worker pool (started in main.py's
+    lifespan) works through it. Deliberately only ever enqueues the
     caller's own account -- not a generic "run any function" endpoint,
     since accepting an arbitrary task/target from the request body
     would be a remote-code-execution hole, not a queue demo."""
     if not user:
         raise HTTPException(status_code=401, detail='Unauthorized')
-    task_queue.enqueue(generate_thumbnail_for_user, user.id)
+    task_queue.publish('image_uploaded', user.id)
     return {'status': 'queued', 'user_id': user.id}
 
 
