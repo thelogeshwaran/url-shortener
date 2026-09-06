@@ -6,20 +6,23 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import select
 
-from app import task_queue
 from app.database import get_session
 from app.main import app
 from app.middleware.rate_limit import _redis as _rate_limit_redis
 from app.models import Url, User
 
-client = TestClient(app)
+# The three "image_uploaded" subscribers now live in their own standalone
+# services (services/*.py) rather than in the app itself -- in a real
+# deployment they'd run as separate processes. For the test session,
+# importing them here registers their subscriptions (each still opens
+# its own independent RedisPubSub/Redis connection) so queue-dependent
+# tests have something actually listening, the same way they would if
+# these services were deployed alongside the app.
+import services.thumbnail_service  # noqa: F401,E402
+import services.analytics_service  # noqa: F401,E402
+import services.notification_service  # noqa: F401,E402
 
-# TestClient only runs FastAPI's lifespan startup (which starts the queue's
-# background worker) when used as a context manager -- plain module-level
-# instantiation, as used everywhere else in this test suite, never fires it.
-# Start the worker explicitly so queue-dependent tests don't hang forever
-# waiting on a thread that was never running.
-task_queue.start_worker()
+client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)

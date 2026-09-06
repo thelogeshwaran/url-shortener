@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from app import cache
-from app import task_queue
 from app.middleware.logging import log_requests
 from app.middleware.blacklist import blacklist
 from app.middleware.rate_limit import rate_limit, rate_limit_api
@@ -19,7 +18,6 @@ from app.middleware.rate_limit_tier import rate_limit_tier
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cache.start_periodic_flush()
-    task_queue.start_worker()
     yield
     await cache.stop_periodic_flush()
 
