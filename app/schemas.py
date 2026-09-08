@@ -1,5 +1,6 @@
 
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, field_validator, HttpUrl, Field, model_validator
 
@@ -99,3 +100,13 @@ class PaginatedUrlsResponse(BaseModel):
 
 class LookupResponse(BaseModel):
     url: str
+
+
+class ThumbnailStatusResponse(BaseModel):
+    status: Literal["pending", "done"]
+    thumbnail_url: str | None = None
+
+
+class ScoreSubmission(BaseModel):
+    player: str
+    score: int

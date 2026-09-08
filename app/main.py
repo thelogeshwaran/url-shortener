@@ -3,7 +3,9 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from app import cache
+from app.thumbnails import THUMBNAIL_DIR
 from app.middleware.logging import log_requests
 from app.middleware.blacklist import blacklist
 from app.middleware.rate_limit import rate_limit, rate_limit_api
@@ -23,6 +25,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# StaticFiles requires the directory to exist at mount time -- normally
+# created lazily by generate_thumbnail_for_user(), so a fresh checkout
+# with zero thumbnails generated yet would otherwise fail to start.
+THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+app.mount('/uploads/thumbnails', StaticFiles(directory=THUMBNAIL_DIR), name='thumbnails')
 
 app.middleware("http")(timed(authorization))
 

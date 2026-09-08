@@ -4,14 +4,15 @@ import time
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app import task_queue
 from app.database import get_session
+from app.leaderboard import get_leaderboard, manager as leaderboard_manager, submit_score
 from app.repositories import UrlRepository, UserRepository
-from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest, PaginatedUrlsResponse, LookupResponse
+from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest, PaginatedUrlsResponse, LookupResponse, ThumbnailStatusResponse, ScoreSubmission
 from app.service import UrlService, UserService
 from app.models import User
 
@@ -173,6 +174,47 @@ def upload_profile_image(
     return {'status': 'uploaded', 'image_path': str(image_path)}
 
 
+LONG_POLL_TIMEOUT_SECONDS = 25
+LONG_POLL_INTERVAL_SECONDS = 0.5
+
+
+def _thumbnail_status_response(db_user: User) -> ThumbnailStatusResponse:
+    if db_user.thumbnail_path:
+        filename = Path(db_user.thumbnail_path).name
+        return ThumbnailStatusResponse(status='done', thumbnail_url=f'/uploads/thumbnails/{filename}')
+    return ThumbnailStatusResponse(status='pending')
+
+
+@router.get('/users/me/thumbnail-status', response_model=ThumbnailStatusResponse)
+def get_thumbnail_status(user: Annotated[User | None, Depends(get_current_user)]) -> ThumbnailStatusResponse:
+    """Long-polling: instead of answering 'pending' immediately and
+    making the client re-ask every second or two, this holds the
+    connection open and re-checks the DB itself every
+    LONG_POLL_INTERVAL_SECONDS, returning the moment it's done -- or
+    after LONG_POLL_TIMEOUT_SECONDS, whichever comes first, so a stuck
+    or crashed worker doesn't leave the connection open forever. The
+    client just calls this in a loop instead of a plain poll loop; each
+    call either returns quickly (done) or after the timeout (still
+    pending, call again).
+
+    A user who's never uploaded an image at all is a distinct 404, not
+    'pending' -- there's nothing in progress to wait on."""
+    if not user:
+        raise HTTPException(status_code=401, detail='Unauthorized')
+
+    repository = UserRepository()
+    db_user = repository.get_user_by_id(user.id)
+    if not db_user.image_path:
+        raise HTTPException(status_code=404, detail='No image uploaded')
+
+    deadline = time.time() + LONG_POLL_TIMEOUT_SECONDS
+    while not db_user.thumbnail_path and time.time() < deadline:
+        time.sleep(LONG_POLL_INTERVAL_SECONDS)
+        db_user = repository.get_user_by_id(user.id)
+
+    return _thumbnail_status_response(db_user)
+
+
 @router.post('/enqueue', status_code=202)
 def enqueue_thumbnail_task(user: Annotated[User | None, Depends(get_current_user)]):
     """Queue-based version of the same background-work idea as /async,
@@ -187,6 +229,36 @@ def enqueue_thumbnail_task(user: Annotated[User | None, Depends(get_current_user
         raise HTTPException(status_code=401, detail='Unauthorized')
     task_queue.publish('image_uploaded', user.id)
     return {'status': 'queued', 'user_id': user.id}
+
+
+@router.post('/scores', status_code=202)
+async def post_score(submission: ScoreSubmission):
+    """Posting a score updates the in-memory leaderboard and pushes the
+    new top-N to every currently-connected WebSocket client -- not just
+    the player who posted it. That's the difference from polling: this
+    one write fans out to everyone watching, instantly, instead of each
+    client separately re-asking on a timer."""
+    submit_score(submission.player, submission.score)
+    await leaderboard_manager.broadcast({'leaderboard': get_leaderboard()})
+    return {'status': 'accepted'}
+
+
+@router.websocket('/ws/leaderboard')
+async def leaderboard_ws(websocket: WebSocket):
+    """Bidirectional connection, but this demo only ever pushes server
+    -> client: on connect, send the current leaderboard once (so a
+    client doesn't have to wait for someone else to score before
+    seeing anything); after that, receive_text() just blocks until the
+    client disconnects -- there's nothing for the client to say back,
+    but the socket has to be read from or the disconnect is never
+    noticed."""
+    await leaderboard_manager.connect(websocket)
+    await websocket.send_json({'leaderboard': get_leaderboard()})
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        leaderboard_manager.disconnect(websocket)
 
 
 @router.get('/health')

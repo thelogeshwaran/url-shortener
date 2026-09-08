@@ -12,11 +12,16 @@ exclued_path = [
     "/lookup",
     "/sync",
     "/async",
+    "/scores",
 ]
 
 
 async def check_api_key(request, call_next):
-    if request.url.path in exclued_path:
+    # /uploads/* are statically-served profile thumbnails -- an <img> tag
+    # can't attach an X-API-Key header, so these have to be reachable
+    # without one (same trade-off as any public avatar URL: guessable by
+    # id, not secret).
+    if request.url.path in exclued_path or request.url.path.startswith('/uploads/'):
         return await call_next(request)
 
     apikey = request.headers.get('x-api-key')
