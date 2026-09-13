@@ -13,6 +13,7 @@ exclued_path = [
     "/sync",
     "/async",
     "/scores",
+    "/sse/leaderboard",
 ]
 
 

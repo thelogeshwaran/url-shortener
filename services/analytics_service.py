@@ -1,6 +1,7 @@
-"""Standalone service: logs every 'image_uploaded' event to analytics.
-Its own process, its own Redis connection, its own subscription -- no
-shared code path with the other two services beyond RedisPubSub itself.
+"""Standalone service: notifies the third-party analytics service every
+time 'image_uploaded' fires, via webhook. Its own process, its own
+Redis connection, its own subscription -- no shared code path with the
+other two services beyond RedisPubSub itself.
 
 Run: python3 -m services.analytics_service
 """
@@ -8,15 +9,18 @@ import logging
 import time
 
 from app.redis_pubsub import RedisPubSub
+from app.webhooks import send_analytics_webhook
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(name)s | %(message)s')
 logger = logging.getLogger('analytics_service')
 
 
 def log_upload(user_id: int) -> None:
-    """Stand-in for a real analytics call."""
-    time.sleep(1)
-    logger.info('user %d: upload event logged to analytics', user_id)
+    """Real analytics call: POSTs a webhook to the configured
+    third-party service. Delivery failures are logged inside
+    send_analytics_webhook itself and never raised here -- analytics
+    being unreachable must not look like this service crashed."""
+    send_analytics_webhook('image_uploaded', {'user_id': user_id})
 
 
 pubsub = RedisPubSub()

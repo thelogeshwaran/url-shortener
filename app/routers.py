@@ -1,3 +1,4 @@
+import json
 import logging
 import threading
 import time
@@ -5,13 +6,14 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import text
 
 from app import task_queue
 from app.database import get_session
-from app.leaderboard import get_leaderboard, manager as leaderboard_manager, submit_score
+from app.leaderboard import get_leaderboard, manager as leaderboard_manager, sse_manager, submit_score
 from app.repositories import UrlRepository, UserRepository
+from app.socketio_server import broadcast_leaderboard as socketio_broadcast_leaderboard
 from app.schemas import ShortenRequest, ShortenResponse, BatchShortenRequest, BatchShortenResponse, EditUrlRequest, PaginatedUrlsResponse, LookupResponse, ThumbnailStatusResponse, ScoreSubmission
 from app.service import UrlService, UserService
 from app.models import User
@@ -234,12 +236,15 @@ def enqueue_thumbnail_task(user: Annotated[User | None, Depends(get_current_user
 @router.post('/scores', status_code=202)
 async def post_score(submission: ScoreSubmission):
     """Posting a score updates the in-memory leaderboard and pushes the
-    new top-N to every currently-connected WebSocket client -- not just
-    the player who posted it. That's the difference from polling: this
-    one write fans out to everyone watching, instantly, instead of each
-    client separately re-asking on a timer."""
+    new top-N to every currently-connected client on all three
+    transports -- the native WebSocket route, Socket.IO, and SSE -- not
+    just the player who posted it. That's the difference from polling:
+    this one write fans out to everyone watching, instantly, instead of
+    each client separately re-asking on a timer."""
     submit_score(submission.player, submission.score)
     await leaderboard_manager.broadcast({'leaderboard': get_leaderboard()})
+    await socketio_broadcast_leaderboard()
+    await sse_manager.broadcast({'leaderboard': get_leaderboard()})
     return {'status': 'accepted'}
 
 
@@ -259,6 +264,29 @@ async def leaderboard_ws(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         leaderboard_manager.disconnect(websocket)
+
+
+@router.get('/sse/leaderboard')
+async def leaderboard_sse():
+    """One-way only, server -> client, over a plain HTTP response kept
+    open rather than a protocol upgrade -- no accept handshake, no
+    receiving from the client at all. Simpler than a WebSocket for
+    exactly this kind of read-only live feed, at the cost of losing
+    the client -> server direction entirely (this app's WS route
+    doesn't use that direction either, but a real chat/game input
+    channel would need it, and SSE just can't provide it)."""
+    queue = sse_manager.subscribe()
+
+    async def event_stream():
+        try:
+            yield f'data: {json.dumps({"leaderboard": get_leaderboard()})}\n\n'
+            while True:
+                message = await queue.get()
+                yield f'data: {json.dumps(message)}\n\n'
+        finally:
+            sse_manager.unsubscribe(queue)
+
+    return StreamingResponse(event_stream(), media_type='text/event-stream')
 
 
 @router.get('/health')

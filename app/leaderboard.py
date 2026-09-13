@@ -9,6 +9,8 @@ when something actually changed -- no polling, no wasted requests, and
 every connected client sees a new score the moment anyone posts one,
 not just their own.
 """
+import asyncio
+
 from fastapi import WebSocket
 
 _scores: dict[str, int] = {}  # player -> best score seen so far
@@ -53,3 +55,33 @@ class LeaderboardConnectionManager:
 
 
 manager = LeaderboardConnectionManager()
+
+
+class LeaderboardSSEManager:
+    """Same broadcast idea as LeaderboardConnectionManager, adapted for
+    Server-Sent Events: SSE is server -> client only, so there's no
+    `WebSocket` object to hold per client, no accept handshake, and no
+    receive loop -- just a plain asyncio.Queue per connected client.
+    Posting a score pushes the new leaderboard into every queue; each
+    client's own stream generator is blocked on `await queue.get()` and
+    wakes up the instant something lands in its queue -- genuine push,
+    not a timer re-checking on an interval."""
+
+    def __init__(self):
+        self._subscriber_queues: list[asyncio.Queue] = []
+
+    def subscribe(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._subscriber_queues.append(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        if queue in self._subscriber_queues:
+            self._subscriber_queues.remove(queue)
+
+    async def broadcast(self, message: dict) -> None:
+        for queue in self._subscriber_queues:
+            await queue.put(message)
+
+
+sse_manager = LeaderboardSSEManager()

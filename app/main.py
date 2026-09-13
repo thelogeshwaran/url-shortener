@@ -2,9 +2,11 @@
 
 from contextlib import asynccontextmanager
 
+import socketio
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from app import cache
+from app.socketio_server import sio
 from app.thumbnails import THUMBNAIL_DIR
 from app.middleware.logging import log_requests
 from app.middleware.blacklist import blacklist
@@ -49,3 +51,10 @@ app.middleware("http")(timed(log_requests))
 app.middleware("http")(timed(timing))
 
 app.include_router(router)
+
+# Additive only -- `app` above is untouched and still the one every test
+# and existing deployment uses. This wraps it with Socket.IO's own ASGI
+# routing: requests to /socket.io/* are handled by `sio`, everything
+# else falls through to `app` unchanged. Run with `uvicorn app.main:socket_app`
+# instead of `app.main:app` to get Socket.IO support active.
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
