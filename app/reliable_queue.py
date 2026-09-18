@@ -49,11 +49,27 @@ no busy-polling). Call it once for the main queue and once for the
 retry queue and you get two independent threads, each waiting on its
 own queue, genuinely concurrent -- not a bounded batch call followed
 by another bounded batch call afterward.
+
+Q7 adds exponential backoff before a retry becomes available at all --
+1s before the 1st retry, 2s before the 2nd, 4s before the 3rd, doubling
+each time. A plain Redis list can't express "not poppable until time T"
+-- RPUSH makes an entry available immediately, always. So a failing
+message doesn't go straight back onto the retry queue; it goes into a
+sorted set (`<queue>:delayed`) scored by the timestamp it's allowed to
+be retried, and a separate small "promoter" loop moves anything whose
+time has come from that sorted set onto the real queue via RPUSH. This
+is the standard way to do delayed re-delivery on top of Redis (the
+same idea Sidekiq/RQ's scheduled-job sets use) -- there's no native
+"deliver this later" primitive, so a sorted set doubling as a timer is
+what stands in for one. The ZREM-then-RPUSH pairing, keyed on ZREM's
+own return value, is what stops the same due entry from being promoted
+twice if this were ever run with more than one promoter.
 """
 import json
 import logging
 import os
 import threading
+import time
 
 import redis
 
@@ -64,6 +80,9 @@ _redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 BLOCK_TIMEOUT_SECONDS = 1  # how long BLPOP waits before checking again -- keeps the loop stoppable, not a busy-loop
 MAX_RETRIES = 5  # total attempts across main + retry queue before giving up to dead-letter
+BACKOFF_BASE_SECONDS = 1  # 1st retry waits 1s, 2nd waits 2s, 3rd waits 4s, ... (2**(attempt-1))
+DELAYED_SUFFIX = ':delayed'
+PROMOTER_POLL_INTERVAL_SECONDS = 0.2
 
 
 def enqueue(queue_name: str, message_id: str) -> None:
@@ -72,6 +91,46 @@ def enqueue(queue_name: str, message_id: str) -> None:
 
 def _requeue(queue_name: str, message_id: str, attempt: int) -> None:
     _redis.rpush(queue_name, json.dumps({'id': message_id, 'attempt': attempt}))
+
+
+def _requeue_with_backoff(queue_name: str, message_id: str, attempt: int) -> float:
+    """Instead of an immediate RPUSH, park the message in a sorted set
+    scored by when it's allowed to become available again. Returns the
+    delay actually used, so callers can log it."""
+    delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+    payload = json.dumps({'id': message_id, 'attempt': attempt})
+    _redis.zadd(f'{queue_name}{DELAYED_SUFFIX}', {payload: time.time() + delay})
+    return delay
+
+
+def _promote_due_delayed(queue_name: str) -> int:
+    """Move any delayed entries for `queue_name` whose backoff has
+    elapsed onto the real queue. Safe to call from more than one
+    promoter: ZREM only succeeds for whoever gets there first, so the
+    RPUSH after it only ever happens once per entry."""
+    delayed_key = f'{queue_name}{DELAYED_SUFFIX}'
+    due = _redis.zrangebyscore(delayed_key, '-inf', time.time())
+    promoted = 0
+    for payload in due:
+        if _redis.zrem(delayed_key, payload):
+            _redis.rpush(queue_name, payload)
+            promoted += 1
+    return promoted
+
+
+def start_delay_promoter(queue_name: str) -> threading.Thread:
+    """Runs forever, moving due delayed retries into `queue_name` once
+    their backoff has elapsed. Start one of these per queue that ever
+    receives backed-off retries (i.e. wherever _requeue_with_backoff
+    targets)."""
+    def loop():
+        while True:
+            _promote_due_delayed(queue_name)
+            time.sleep(PROMOTER_POLL_INTERVAL_SECONDS)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
 
 
 def _process_one(
@@ -106,8 +165,11 @@ def _process_one(
             _requeue(dead_letter, message_id, attempt)
         else:
             target = retry_queue_name or queue_name
-            logger.exception("failed to process %r (attempt %d/%d) -- retrying via %r", message_id, attempt, MAX_RETRIES, target)
-            _requeue(target, message_id, attempt)
+            delay = _requeue_with_backoff(target, message_id, attempt)
+            logger.exception(
+                "failed to process %r (attempt %d/%d) -- retrying via %r in %gs",
+                message_id, attempt, MAX_RETRIES, target, delay,
+            )
     return True
 
 
