@@ -7,6 +7,10 @@ Run: python3 -m services.notification_service
 import logging
 import time
 
+from dotenv import load_dotenv
+
+load_dotenv()  # standalone entry point -- .env is otherwise never loaded outside app.main
+
 from app.redis_pubsub import RedisPubSub
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(name)s | %(message)s')

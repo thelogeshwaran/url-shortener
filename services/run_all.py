@@ -14,9 +14,14 @@ Run: python3 -m services.run_all
 import logging
 import time
 
-import services.analytics_service  # noqa: F401
-import services.notification_service  # noqa: F401
-import services.thumbnail_service  # noqa: F401
+from dotenv import load_dotenv
+
+load_dotenv()  # must run before the service imports below -- each one talks to
+                # Redis/webhooks at import time, reading env vars as it goes
+
+import services.analytics_service  # noqa: F401,E402
+import services.notification_service  # noqa: F401,E402
+import services.thumbnail_service  # noqa: F401,E402
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(name)s | %(message)s')
 logger = logging.getLogger('run_all')

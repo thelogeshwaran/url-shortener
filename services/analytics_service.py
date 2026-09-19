@@ -8,6 +8,10 @@ Run: python3 -m services.analytics_service
 import logging
 import time
 
+from dotenv import load_dotenv
+
+load_dotenv()  # standalone entry point -- .env is otherwise never loaded outside app.main
+
 from app.redis_pubsub import RedisPubSub
 from app.webhooks import send_analytics_webhook
 

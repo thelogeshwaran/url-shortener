@@ -9,6 +9,10 @@ Run: python3 -m services.thumbnail_service
 import logging
 import time
 
+from dotenv import load_dotenv
+
+load_dotenv()  # standalone entry point -- .env is otherwise never loaded outside app.main
+
 from app.redis_pubsub import RedisPubSub
 from app.thumbnails import generate_thumbnail_for_user
 
