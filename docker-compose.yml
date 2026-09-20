@@ -37,5 +37,15 @@ services:
     depends_on:
       - kafka
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP -- what producers/consumers actually connect to
+      - "15672:15672"  # management UI: http://localhost:15672 (guest/guest)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
 volumes:
   kafka_data:
+  rabbitmq_data:
